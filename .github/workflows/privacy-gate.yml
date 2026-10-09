@@ -1,0 +1,31 @@
+name: privacy-gate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0            # the gate scans full history
+          persist-credentials: false
+
+      # On PRs, run the gate as it exists on the base branch, so a PR
+      # can't weaken the gate and have its own weakened copy approve it.
+      - name: Select gate version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] &&
+             git cat-file -e "origin/$GITHUB_BASE_REF:scripts/privacy_gate.py" 2>/dev/null; then
+            git show "origin/$GITHUB_BASE_REF:scripts/privacy_gate.py" > "$RUNNER_TEMP/privacy_gate.py"
+          else
+            cp scripts/privacy_gate.py "$RUNNER_TEMP/privacy_gate.py"
+          fi
+
+      - name: Run privacy & security gate
+        run: python3 "$RUNNER_TEMP/privacy_gate.py" --all

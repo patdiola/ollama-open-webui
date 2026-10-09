@@ -1,0 +1,11 @@
+# Personal settings and secrets - never commit
+.env
+.privacy-denylist
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/

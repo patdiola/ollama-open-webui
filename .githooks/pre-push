@@ -1,0 +1,11 @@
+#!/bin/sh
+# Privacy & security gate. Enable once per clone:  git config core.hooksPath .githooks
+# Fails closed: if Python can't be found, the push is blocked.
+root=$(git rev-parse --show-toplevel) || exit 1
+for py in python3 python "py -3"; do
+  if $py -c "import sys; sys.exit(sys.version_info < (3, 9))" >/dev/null 2>&1; then
+    exec $py "$root/scripts/privacy_gate.py" --pre-push "$@"
+  fi
+done
+echo "privacy-gate: Python 3.9+ not found; blocking push." >&2
+exit 1

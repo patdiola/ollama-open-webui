@@ -1,0 +1,4 @@
+# Copy to .privacy-denylist (gitignored) and add one term per line.
+# The gate blocks any push containing these, case-insensitive.
+# Good candidates: your real name, PC hostname, tailnet name,
+# Windows/macOS username, home network SSID, router model.

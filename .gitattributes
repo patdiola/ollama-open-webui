@@ -1,0 +1,4 @@
+# LF everywhere (Docker reads .env and compose files), except Windows scripts.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

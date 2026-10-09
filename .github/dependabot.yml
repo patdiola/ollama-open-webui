@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Keeps SHA-pinned actions current; updates arrive as PRs through the gate.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14   # skip releases younger than two weeks
