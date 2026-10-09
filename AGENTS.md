@@ -51,7 +51,7 @@ database; tell the user to change those in the Admin Panel instead.
 
 | Path | Purpose |
 | --- | --- |
-| `setup.sh` / `setup.ps1` (+ `setup.cmd`) | Same flow for macOS/Linux and Windows. Keep them in sync |
+| `setup.sh` / `setup.ps1` (+ `setup.cmd`) | Same flow for macOS/Linux and Windows. Keep them in sync. In WSL, `setup.sh` hands off to `setup.ps1` |
 | `compose.yaml` | Open WebUI, plus optional containerized Ollama profiles |
 | `.env.example` | All options with safe defaults; secrets empty |
 | `models.txt` | Model catalog shown by setup (`tag\|GB\|description`) |

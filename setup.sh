@@ -89,12 +89,25 @@ gen_secret() {
   else od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; fi
 }
 
+# Ubuntu (or any distro) on Windows via WSL: hand off to the Windows setup.
+# Ollama, Docker Desktop and Tailscale run best as Windows apps: they start
+# with Windows and stay up, while WSL shuts down when its terminal closes.
+# Set SETUP_IN_WSL=1 to run the Linux setup inside WSL anyway (unsupported).
+if [ -z "${SETUP_IN_WSL:-}" ] && grep -qi microsoft /proc/version 2>/dev/null; then
+  case "$PWD" in
+    /mnt/[a-z]/*) ;;
+    *) die "This repo is inside WSL's own filesystem. Clone it to a Windows folder
+(for example under /mnt/c/), then run ./setup.sh from there." ;;
+  esac
+  have powershell.exe || die "Can't find powershell.exe. Run setup.cmd from Windows instead."
+  bold "WSL detected: running the Windows setup (setup.ps1)."
+  exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$PWD/setup.ps1")" "$@"
+fi
+
 OS=$(uname -s)
 case "$OS" in
   Darwin) OS_NAME=macOS ;;
-  Linux)  OS_NAME=Linux
-          grep -qi microsoft /proc/version 2>/dev/null &&
-            warn "This looks like WSL. On Windows, run setup.cmd from Windows instead." ;;
+  Linux)  OS_NAME=Linux ;;
   *) die "Unsupported OS: $OS. On Windows, run setup.cmd." ;;
 esac
 
