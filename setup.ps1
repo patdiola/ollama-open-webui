@@ -16,6 +16,7 @@ Set-Location -LiteralPath $PSScriptRoot
 $EnvFile = Join-Path $PSScriptRoot ".env"
 $ExampleFile = Join-Path $PSScriptRoot ".env.example"
 $OllamaServices = @("ollama-cpu", "ollama-nvidia", "ollama-amd")
+$OllamaTuning = @("OLLAMA_CONTEXT_LENGTH", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE")
 $script:TsUrl = ""
 
 # ------------------------------------------------------------------ helpers
@@ -53,6 +54,13 @@ function YesNo([string]$q, [string]$def) {
 }
 
 function Have([string]$name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+
+# Reloads PATH from Windows, so programs installed after this terminal (or
+# WSL, which passes on the PATH it started with) opened are found.
+function Refresh-Path {
+  $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+}
+Refresh-Path
 
 # Runs a native command, hiding its output. Returns $true on exit code 0.
 function Quiet([string]$exe, [string[]]$argv) {
@@ -127,7 +135,7 @@ function Offer-Install([string]$what, [string]$wingetId) {
       Fail "Installing $what failed. Install it manually, then run setup.cmd again."
     }
     # Pick up PATH changes from the installer.
-    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+    Refresh-Path
   } else {
     Fail "Install $what, then run setup.cmd again."
   }
@@ -193,6 +201,44 @@ function Pick-Models([string]$current) {
     } else { $out += $c }
   }
   return ($out -join " ")
+}
+
+# Suggests GPU memory settings, leaving headroom for context and other apps.
+function Configure-Memory([string]$models) {
+  $budget = (Get-MemoryBudget)[0]
+  $largest = 0; $largestTag = ""
+  $catalog = Get-Catalog
+  foreach ($m in ($models -split "\s+" | Where-Object { $_ })) {
+    foreach ($c in $catalog) {
+      if ($c[0] -eq $m -and $c[1] -gt $largest) { $largest = $c[1]; $largestTag = $m }
+    }
+  }
+  $left = [math]::Round($budget * 0.9 - $largest, 1)
+  $suggest = 4096
+  if ($left -ge 2) { $suggest = 8192 }
+  if ($left -ge 6) { $suggest = 16384 }
+  Say "Besides the model itself, Ollama needs memory for the conversation it"
+  Say "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
+  Say "part of the model runs on the CPU and replies get much slower."
+  Say "  Memory for models: $budget GB, keeping 10% free for Windows and other apps"
+  if ($largestTag) { Say "  Largest model:     $largestTag, about $largest GB" }
+  Say "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
+  Say "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
+  Say "show 100% GPU while a model is loaded."
+  $def = EnvGet "OLLAMA_CONTEXT_LENGTH"
+  if (-not $def) { $def = "$suggest" }
+  do { $ctx = Ask "Context length in tokens" $def } until ($ctx -match "^\d+$")
+  if ($ctx -eq "0") { $ctx = "" }
+  Say ""
+  Say "Flash attention with an 8-bit context cache (q8_0) roughly halves the"
+  Say "context memory, with little quality loss. Recommended."
+  $faDef = "y"
+  if ((EnvGet "OLLAMA_FLASH_ATTENTION") -eq "0") { $faDef = "n" }
+  if (YesNo "Turn them on?" $faDef) {
+    $fa = "1"; $kv = EnvGet "OLLAMA_KV_CACHE_TYPE"
+    if (-not $kv) { $kv = "q8_0" }
+  } else { $fa = "0"; $kv = "" }
+  return @($ctx, $fa, $kv)
 }
 
 function Configure-Cloud {
@@ -275,7 +321,7 @@ function Configure {
   Say "Answer each question, or press Enter to keep the value in [brackets]."
   Say "Nothing is changed until you confirm at the end."
 
-  Step "1/6  Ollama"
+  Step "1/7  Ollama"
   Say "native:    the Ollama app for Windows. Recommended: simplest, and uses"
   Say "           NVIDIA and AMD graphics cards automatically."
   Say "container: Ollama inside Docker. Only if you prefer everything in Docker;"
@@ -292,15 +338,18 @@ function Configure {
     do { $hw = Ask "Ollama hardware" $hw } until (@("ollama-cpu", "ollama-nvidia") -contains $hw)
   }
 
-  Step "2/6  Models"
+  Step "2/7  Models"
   $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
 
-  Step "3/6  Local port"
+  Step "3/7  GPU memory"
+  $memory = Configure-Memory $models
+
+  Step "4/7  Local port"
   Say "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
   Say "another app already uses it; then pick any free number like 3001 or 8080."
   do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
 
-  Step "4/6  Remote access (Tailscale)"
+  Step "5/7  Remote access (Tailscale)"
   Say "Tailscale lets your phone and laptop reach this machine from anywhere at"
   Say "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
   Say "Wi-Fi network or the internet. It's free for personal use: create an"
@@ -311,11 +360,11 @@ function Configure {
   $ts = "false"
   if (YesNo "Set up Tailscale remote access?" $tsDef) { $ts = "true" }
 
-  Step "5/6  Optional extras"
+  Step "6/7  Optional extras"
   $cloud = Configure-Cloud
   $search = Configure-Search
 
-  Step "6/6  Where settings live"
+  Step "7/7  Where settings live"
   Say "a) .env (recommended): your answers here, or edits to .env (by hand or by"
   Say "   an AI coding CLI), are applied on every start. Changes you make to the"
   Say "   same settings in Open WebUI's Admin Panel reset on restart."
@@ -337,6 +386,9 @@ function Configure {
   $cloudText = $cloud[0]; if (-not $cloudText) { $cloudText = "(none)" }
   Say "Ollama:        $modeText"
   Say "Models:        $modelText"
+  $ctxText = $memory[0]; if (-not $ctxText) { $ctxText = "Ollama default" }
+  if ($memory[1] -eq "1") { $ctxText = "$ctxText tokens, flash attention, $($memory[2]) cache" }
+  Say "Context:       $ctxText"
   Say "Local URL:     http://localhost:$port"
   Say "Tailscale:     $ts"
   Say "Cloud APIs:    $cloudText"
@@ -359,6 +411,9 @@ function Configure {
     EnvSet "OLLAMA_BASE_URL" "http://host.docker.internal:11434"
   }
   EnvSet "OLLAMA_PULL_MODELS" $models
+  EnvSet "OLLAMA_CONTEXT_LENGTH" $memory[0]
+  EnvSet "OLLAMA_FLASH_ATTENTION" $memory[1]
+  EnvSet "OLLAMA_KV_CACHE_TYPE" $memory[2]
   EnvSet "OPEN_WEBUI_PORT" $port
   EnvSet "TAILSCALE_SERVE" $ts
   EnvSet "OPENAI_API_BASE_URLS" $cloud[0]
@@ -381,7 +436,17 @@ function Check-Docker {
   if (-not (Have "docker")) { Offer-Install "Docker Desktop" "Docker.DockerDesktop" }
   if (-not (Quiet "docker" @("compose", "version"))) { Fail "Docker Compose v2 is missing (the 'docker compose' command)." }
   if (-not (Quiet "docker" @("info"))) {
-    Fail "Docker isn't running. Start Docker Desktop, wait until it says 'Engine running', then run setup.cmd again."
+    $app = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
+    if (Test-Path -LiteralPath $app) {
+      Say "Starting Docker Desktop (this can take a minute or two)..."
+      Say "First time? Accept its license in the Docker Desktop window."
+      Start-Process -FilePath $app
+      for ($i = 0; $i -lt 60 -and -not (Quiet "docker" @("info")); $i++) { Start-Sleep -Seconds 3 }
+    }
+    if (-not (Quiet "docker" @("info"))) {
+      Fail ("Docker isn't running. Start Docker Desktop, wait until it says 'Engine running', then run setup.cmd again. " +
+        "Just installed it? Sign out of Windows and back in first.")
+    }
   }
   Ok "Docker is running"
 }
@@ -408,6 +473,34 @@ function Check-NativeOllama {
     if (-not (Ollama-Up)) { Fail "Ollama didn't start. Open the Ollama app, then run setup.cmd again." }
   }
   Ok "Ollama is running"
+}
+
+# The Ollama app reads its settings from Windows user environment variables,
+# not .env. Copy them over (empty in .env removes them) and restart Ollama
+# if one changed.
+function Sync-OllamaEnv {
+  if ((EnvGet "OLLAMA_KV_CACHE_TYPE") -and (EnvGet "OLLAMA_FLASH_ATTENTION") -ne "1") {
+    Warn "OLLAMA_KV_CACHE_TYPE only works with OLLAMA_FLASH_ATTENTION=1."
+  }
+  $changed = $false
+  foreach ($k in $OllamaTuning) {
+    $want = EnvGet $k
+    if (-not $want) { $want = $null }
+    if ($want -ne [Environment]::GetEnvironmentVariable($k, "User")) {
+      [Environment]::SetEnvironmentVariable($k, $want, "User")
+      $changed = $true
+    }
+    # Ollama started by this script inherits this process's environment.
+    [Environment]::SetEnvironmentVariable($k, $want, "Process")
+  }
+  if (-not $changed) { return }
+  Ok "Ollama settings saved to your Windows user environment variables"
+  if (Ollama-Up) {
+    Say "Restarting Ollama to apply them..."
+    Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 15 -and (Ollama-Up); $i++) { Start-Sleep -Seconds 1 }
+    if (Ollama-Up) { Warn "Couldn't stop Ollama. Quit it from the system tray and start it again to apply them." }
+  }
 }
 
 function Invoke-Ollama([string[]]$argv) {
@@ -493,7 +586,7 @@ function Apply {
 
   Step "Checking prerequisites"
   Check-Docker
-  if ($mode -eq "native") { Check-NativeOllama }
+  if ($mode -eq "native") { Sync-OllamaEnv; Check-NativeOllama }
 
   Step "Starting containers"
   # Remove an Ollama container from a previously chosen profile.

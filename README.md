@@ -17,7 +17,7 @@ cd ollama-open-webui
 | --- | --- |
 | macOS / Linux | `./setup.sh` |
 | Windows | `setup.cmd` (double-click, or run it from a terminal in this folder) |
-| Windows, from Ubuntu (WSL) | `./setup.sh` in a clone under `/mnt/c/...`; it runs the Windows setup for you |
+| Windows, from Ubuntu (WSL) | `./setup.sh`; it runs the Windows setup for you (a clone inside WSL, e.g. `~/git/...`, is first copied to the same path under your Windows user folder) |
 
 Setup asks every question up front, saves your answers to `.env`, then:
 

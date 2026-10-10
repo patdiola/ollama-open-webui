@@ -8,6 +8,10 @@ x-ollama: &ollama
   image: ollama/ollama:${OLLAMA_TAG:-latest}
   container_name: ollama
   restart: always
+  environment:
+    OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-}
+    OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-}
+    OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE:-}
   volumes:
     - ollama-models:/root/.ollama
   networks:

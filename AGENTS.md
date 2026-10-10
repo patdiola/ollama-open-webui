@@ -36,6 +36,7 @@ Every option is documented in [.env.example](.env.example). Common requests:
 | Cloud provider | append to `OPENAI_API_BASE_URLS` and `OPENAI_API_KEYS` (`;`-separated, same order), set `ENABLE_OPENAI_API=true` |
 | Web search | `ENABLE_WEB_SEARCH=true`, `WEB_SEARCH_ENGINE=duckduckgo\|brave\|tavily`, plus `BRAVE_SEARCH_API_KEY` or `TAVILY_API_KEY` |
 | Port | `OPEN_WEBUI_PORT`; then re-run setup so `tailscale serve` points at it |
+| Quantization / GPU memory | pick a quantized tag in `OLLAMA_PULL_MODELS` (e.g. `qwen3:14b-q8_0`); `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`. Setup syncs these to native Ollama (Windows user env vars / launchctl) or the container |
 | Linux GPU | `COMPOSE_PROFILES=ollama-nvidia\|ollama-amd\|ollama-cpu` |
 | Pin Open WebUI | `OPEN_WEBUI_TAG=<release tag>` (default `main`) |
 

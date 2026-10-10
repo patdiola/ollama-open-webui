@@ -14,6 +14,7 @@ cd "$(dirname "$0")"
 
 ENV_FILE=.env
 OLLAMA_SERVICES="ollama-cpu ollama-nvidia ollama-amd"
+OLLAMA_TUNING="OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE"
 
 # ------------------------------------------------------------------ helpers
 
@@ -93,13 +94,54 @@ gen_secret() {
 # Ollama, Docker Desktop and Tailscale run best as Windows apps: they start
 # with Windows and stay up, while WSL shuts down when its terminal closes.
 # Set SETUP_IN_WSL=1 to run the Linux setup inside WSL anyway (unsupported).
+#
+# PowerShell can't run a script stored inside WSL's own filesystem, so a repo
+# there (e.g. ~/git/...) is cloned to the same path under the Windows user
+# folder, along with the personal gitignored files, and setup continues there.
+wsl_move_to_windows() {
+  local win_home rel dest f
+  win_home=$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("UserProfile")' 2>/dev/null | tr -d '\r')
+  [ -n "$win_home" ] || die "Can't find your Windows user folder. Clone this repo under /mnt/c/, then run ./setup.sh from there."
+  win_home=$(wslpath -u "$win_home")
+  case "$PWD" in
+    "$HOME"/*) rel=${PWD#"$HOME"/} ;;
+    *) rel=$(basename "$PWD") ;;
+  esac
+  dest="$win_home/$rel"
+
+  bold "WSL detected, but this repo is inside WSL's own filesystem."
+  info "The Windows setup needs it in a Windows folder."
+  if [ -f "$dest/setup.sh" ]; then
+    info "Using the existing copy at $(wslpath -w "$dest")"
+  else
+    [ -e "$dest" ] && die "$(wslpath -w "$dest") already exists. Move it aside, or clone this repo under /mnt/c/ yourself."
+    have git || die "git is not installed. Clone this repo under /mnt/c/, then run ./setup.sh from there."
+    [ -z "$(git status --porcelain 2>/dev/null)" ] || warn "Uncommitted changes here won't be copied."
+    yesno "Clone it to $(wslpath -w "$dest") and continue there?" y \
+      || die "Clone this repo under /mnt/c/, then run ./setup.sh from there."
+    mkdir -p "$(dirname "$dest")"
+    git clone -q "$PWD" "$dest" || die "Cloning to $(wslpath -w "$dest") failed."
+    if f=$(git remote get-url origin 2>/dev/null); then
+      git -C "$dest" remote set-url origin "$f"
+    fi
+    ok "Cloned to $(wslpath -w "$dest")"
+  fi
+  for f in .env .privacy-denylist; do
+    if [ -f "$f" ] && [ ! -e "$dest/$f" ]; then
+      cp -p "$f" "$dest/$f" && ok "Copied $f"
+    fi
+  done
+  info "Use that copy from now on: cd $dest"
+  cd "$dest"
+  exec bash ./setup.sh "$@"
+}
+
 if [ -z "${SETUP_IN_WSL:-}" ] && grep -qi microsoft /proc/version 2>/dev/null; then
+  have powershell.exe || die "Can't find powershell.exe. Run setup.cmd from Windows instead."
   case "$PWD" in
     /mnt/[a-z]/*) ;;
-    *) die "This repo is inside WSL's own filesystem. Clone it to a Windows folder
-(for example under /mnt/c/), then run ./setup.sh from there." ;;
+    *) wsl_move_to_windows "$@" ;;
   esac
-  have powershell.exe || die "Can't find powershell.exe. Run setup.cmd from Windows instead."
   bold "WSL detected: running the Windows setup (setup.ps1)."
   exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$PWD/setup.ps1")" "$@"
 fi
@@ -188,6 +230,42 @@ pick_models() {
   MODELS=$(echo $out)
 }
 
+# Suggests GPU memory settings, leaving headroom for context and other apps.
+configure_memory() {
+  local mem budget m size largest=0 largest_tag="" left suggest def
+  mem=$(detect_memory); budget=${mem%%|*}
+  for m in $MODELS; do
+    size=$(grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$m" '$1 == t { print $2 }')
+    [ -n "$size" ] || continue
+    if awk -v a="$size" -v b="$largest" 'BEGIN { exit !(a > b) }'; then largest=$size; largest_tag=$m; fi
+  done
+  left=$(awk -v b="$budget" -v l="$largest" 'BEGIN { printf "%.1f", b * 0.9 - l }')
+  suggest=$(awk -v x="$left" 'BEGIN { print (x >= 6) ? 16384 : (x >= 2) ? 8192 : 4096 }')
+  info "Besides the model itself, Ollama needs memory for the conversation it"
+  info "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
+  info "part of the model runs on the CPU and replies get much slower."
+  info "  Memory for models: $budget GB, keeping 10% free for the desktop and other apps"
+  [ -n "$largest_tag" ] && info "  Largest model:     $largest_tag, about $largest GB"
+  info "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
+  info "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
+  info "show 100% GPU while a model is loaded."
+  def=$(env_get OLLAMA_CONTEXT_LENGTH); [ -n "$def" ] || def=$suggest
+  while true; do
+    ask "Context length in tokens" "$def"
+    case "$REPLY" in ''|*[!0-9]*) ;; *) CTX=$REPLY; break ;; esac
+  done
+  [ "$CTX" = 0 ] && CTX=""
+  info ""
+  info "Flash attention with an 8-bit context cache (q8_0) roughly halves the"
+  info "context memory, with little quality loss. Recommended."
+  def=y; [ "$(env_get OLLAMA_FLASH_ATTENTION)" = 0 ] && def=n
+  if yesno "Turn them on?" "$def"; then
+    FA=1; KV=$(env_get OLLAMA_KV_CACHE_TYPE); [ -n "$KV" ] || KV=q8_0
+  else
+    FA=0; KV=""
+  fi
+}
+
 configure_cloud() {
   local urls keys url key n
   urls=$(env_get OPENAI_API_BASE_URLS); keys=$(env_get OPENAI_API_KEYS)
@@ -266,7 +344,7 @@ configure() {
   info "Answer each question, or press Enter to keep the value in [brackets]."
   info "Nothing is changed until you confirm at the end."
 
-  step "1/6  Ollama"
+  step "1/7  Ollama"
   local profile=""
   if [ "$OS" = Darwin ]; then
     MODE=native
@@ -287,10 +365,13 @@ configure() {
     done
   fi
 
-  step "2/6  Models"
+  step "2/7  Models"
   pick_models "$(env_get OLLAMA_PULL_MODELS)"
 
-  step "3/6  Local port"
+  step "3/7  GPU memory"
+  configure_memory
+
+  step "4/7  Local port"
   info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
   info "another app already uses it; then pick any free number like 3001 or 8080."
   while true; do
@@ -298,7 +379,7 @@ configure() {
     case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
   done
 
-  step "4/6  Remote access (Tailscale)"
+  step "5/7  Remote access (Tailscale)"
   info "Tailscale lets your phone and laptop reach this machine from anywhere at"
   info "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
   info "Wi-Fi network or the internet. It's free for personal use: create an"
@@ -307,11 +388,11 @@ configure() {
   if yesno "Set up Tailscale remote access?" "$( [ "$(env_get TAILSCALE_SERVE)" = false ] && echo n || echo y)"; then
     TS=true; else TS=false; fi
 
-  step "5/6  Optional extras"
+  step "6/7  Optional extras"
   configure_cloud
   configure_search
 
-  step "6/6  Where settings live"
+  step "7/7  Where settings live"
   info "a) .env (recommended): your answers here, or edits to .env (by hand or by"
   info "   an AI coding CLI), are applied on every start. Changes you make to the"
   info "   same settings in Open WebUI's Admin Panel reset on restart."
@@ -328,6 +409,7 @@ configure() {
   step "Summary"
   info "Ollama:        $MODE${profile:+ ($profile)}"
   info "Models:        ${MODELS:-(none)}"
+  info "Context:       ${CTX:-Ollama default}$( [ "$FA" = 1 ] && echo " tokens, flash attention, $KV cache")"
   info "Local URL:     http://localhost:$PORT"
   info "Tailscale:     $TS"
   info "Cloud APIs:    ${CLOUD_URLS:-(none)}"
@@ -350,6 +432,9 @@ configure() {
     env_set OLLAMA_BASE_URL "http://host.docker.internal:11434"
   fi
   env_set OLLAMA_PULL_MODELS "$MODELS"
+  env_set OLLAMA_CONTEXT_LENGTH "$CTX"
+  env_set OLLAMA_FLASH_ATTENTION "$FA"
+  env_set OLLAMA_KV_CACHE_TYPE "$KV"
   env_set OPEN_WEBUI_PORT "$PORT"
   env_set TAILSCALE_SERVE "$TS"
   env_set OPENAI_API_BASE_URLS "$CLOUD_URLS"
@@ -376,6 +461,14 @@ check_docker() {
     offer_install Docker "curl -fsSL https://get.docker.com | $SUDO sh"
   fi
   docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is missing (the 'docker compose' command)."
+  if [ "$OS" = Darwin ] && ! docker info >/dev/null 2>&1; then
+    local app=Docker i
+    [ -d /Applications/OrbStack.app ] && app=OrbStack
+    if open -a "$app" 2>/dev/null; then
+      info "Starting $app (this can take a minute or two)..."
+      for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 3; done
+    fi
+  fi
   if ! docker info >/dev/null 2>&1; then
     if [ "$OS" = Darwin ]; then
       die "Docker isn't running. Start Docker Desktop or OrbStack, then re-run."
@@ -402,6 +495,42 @@ check_native_ollama() {
     ollama_up || die "Ollama didn't start. Open the Ollama app, then re-run."
   fi
   ok "Ollama is running"
+}
+
+# Native Ollama doesn't read .env. macOS: copy the settings to the app
+# environment with launchctl (lasts until reboot; setup re-applies it; empty
+# in .env removes them) and restart Ollama if one changed. Linux: the
+# settings belong in the ollama systemd service.
+sync_native_ollama_env() {
+  local k want changed="" i
+  if [ -n "$(env_get OLLAMA_KV_CACHE_TYPE)" ] && [ "$(env_get OLLAMA_FLASH_ATTENTION)" != 1 ]; then
+    warn "OLLAMA_KV_CACHE_TYPE only works with OLLAMA_FLASH_ATTENTION=1."
+  fi
+  if [ "$OS" != Darwin ]; then
+    if [ -n "$(env_get OLLAMA_CONTEXT_LENGTH)$(env_get OLLAMA_FLASH_ATTENTION)$(env_get OLLAMA_KV_CACHE_TYPE)" ]; then
+      warn "Native Ollama on Linux doesn't read .env. Add the OLLAMA_* settings to its service: $SUDO systemctl edit ollama"
+    fi
+    return 0
+  fi
+  for k in $OLLAMA_TUNING; do
+    want=$(env_get "$k")
+    if [ "$want" != "$(launchctl getenv "$k" 2>/dev/null)" ]; then
+      if [ -n "$want" ]; then launchctl setenv "$k" "$want"; else launchctl unsetenv "$k"; fi
+      changed=1
+    fi
+    # The `ollama serve` fallback in check_native_ollama inherits these.
+    if [ -n "$want" ]; then export "$k=$want"; else unset "$k"; fi
+  done
+  [ -n "$changed" ] || return 0
+  ok "Ollama settings applied"
+  if ollama_up; then
+    info "Restarting Ollama to apply them..."
+    osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || true
+    pkill -x ollama >/dev/null 2>&1 || true
+    for i in $(seq 1 15); do ollama_up || break; sleep 1; done
+    ollama_up && warn "Couldn't stop Ollama. Quit it from the menu bar and open it again to apply them."
+  fi
+  return 0
 }
 
 check_gpu_runtime() {
@@ -515,7 +644,7 @@ apply() {
 
   step "Checking prerequisites"
   check_docker
-  if [ "$mode" = native ]; then check_native_ollama; else check_gpu_runtime "$profile"; fi
+  if [ "$mode" = native ]; then sync_native_ollama_env; check_native_ollama; else check_gpu_runtime "$profile"; fi
 
   step "Starting containers"
   # Remove an Ollama container from a previously chosen profile.
