@@ -76,6 +76,12 @@ interface**. Whoever runs the host machine can still read the database in
 the Docker volume. Tell your family that. For conversations that must not be
 stored at all, use Open WebUI's **temporary chat** mode.
 
+Memory is on by default: the model saves facts each person mentions (where
+they live, what they work on) to their own account and uses them in later
+chats. Each person can see and delete theirs in Settings → Personalization →
+Memory; the host can read them in the database like chats. Set
+`ENABLE_MEMORY_BACKGROUND_REVIEW=false` to stop automatic saving.
+
 ## Sharing one GPU
 
 Ollama queues requests, so several people can use it at once. Responses slow

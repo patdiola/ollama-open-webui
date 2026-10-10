@@ -65,6 +65,7 @@ Notes:
 | Tailscale remote access | on | tailnet only; never Funnel |
 | Cloud models | off | OpenAI, OpenRouter, or any OpenAI-compatible API. Chats sent to them leave your machine |
 | Web search | on, auto | Tavily → SerpAPI → DuckDuckGo, switching automatically when one fails or runs out. Setup walks you through two free accounts (Tavily, SerpAPI) and checks the keys; without them it uses DuckDuckGo. `off` for no web access |
+| Memory | on | after each message the chat model saves lasting facts about you (city, projects, preferences) and adds them to new chats. Stored only on this machine; see or delete them in Settings → Personalization → Memory |
 | Settings source | `.env` | `.env` re-applied on every start; or let the Admin Panel own them |
 
 Everything lands in `.env`, which is gitignored and created with owner-only permissions on macOS/Linux. See [`.env.example`](.env.example) for every option.
