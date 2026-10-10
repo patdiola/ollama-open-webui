@@ -66,7 +66,10 @@ Keep this policy out of the repo: it contains your Tailscale IP.
    vulnerabilities were stored XSS that required a user with model-creation
    permission to plant malicious content. Without that permission, those
    attacks aren't available to other accounts.
-4. Consider a separate admin account that you use only for administration,
+4. With setup's Recommended choice, **Chat** and **Code** are available to
+   every account; other models stay hidden and admin-only. To share another
+   model, open it in Admin Panel → Settings → Models and make it public.
+5. Consider a separate admin account that you use only for administration,
    and a regular **user** account for your own day-to-day chats.
 
 ## What "private" means here, honestly

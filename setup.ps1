@@ -43,6 +43,12 @@ function Warn([string]$m) { Write-Host "  ! " -ForegroundColor Yellow -NoNewline
 function Fail([string]$m) { Write-Host ""; Write-Host "  Error: $m" -ForegroundColor Red; exit 1 }
 
 # Section header, with space around it.
+# Numbered step header: "N of StepTotal - Title"
+function NStep([string]$m) {
+  $script:StepN++
+  Step "$($script:StepN) of $($script:StepTotal) $($script:Dot) $m"
+}
+
 function Step([string]$m) {
   Write-Host ""; Write-Host ""
   Write-Host "  $m" -ForegroundColor Cyan
@@ -687,7 +693,7 @@ function Search-Key([string]$provider, [string]$cur) {
     $c = Choose "$name key" $def @(
       "open|Open the sign-up page|in your browser, then paste the key here",
       "paste|Paste a key|I already have one",
-      "skip|Skip for now|add it later with setup.cmd configure")
+      "skip|Skip (not recommended)|add it later with setup.cmd configure")
     if ($c -eq "skip") { return "" }
     if ($c -eq "open") {
       try { Start-Process $signup; Note "Opened $signup" } catch { Note "Open $signup in your browser." }
@@ -704,6 +710,94 @@ function Search-Key([string]$provider, [string]$cur) {
   }
 }
 
+# Why web search and the two free accounts matter.
+function Show-SearchWhy {
+  Say "A local model only knows what it learned in training, which ends months"
+  Say "or years before today. With web search it looks things up first, so"
+  Say "answers about new software, products, prices, weather and news are right."
+  Write-Host ""
+  Write-Host "  Two free accounts make search work well (about 5 minutes):" -ForegroundColor White
+  Write-Host "    Tavily    " -ForegroundColor White -NoNewline; Write-Host "1,000 free searches a month; built for AI, returns the useful"
+  Say "            part of each page"
+  Write-Host "    SerpAPI   " -ForegroundColor White -NoNewline; Write-Host "250 free searches a month; Google results, used when Tavily"
+  Say "            fails or runs out"
+  Say "A question takes 1 to 3 searches, so the free plans cover several hundred"
+  Say "questions a month, plenty for a household. If both run out, search falls"
+  Say "back to DuckDuckGo (no account, weaker results) until the month resets."
+  Note "Only the search terms the model writes are sent; your chats stay here."
+}
+
+# Web search with the two free accounts. Returns @(engine, brave, tavily, serpapi).
+function Recommended-Search {
+  $brave = EnvGet "BRAVE_SEARCH_API_KEY"
+  Show-SearchWhy
+  $tavily = Search-Key "tavily" (EnvGet "TAVILY_API_KEY")
+  $serpapi = Search-Key "serpapi" (EnvGet "SERPAPI_API_KEY")
+  if (-not $tavily -and -not $serpapi) {
+    Write-Host ""
+    Warn "No keys yet, so search uses DuckDuckGo, and answers about anything recent"
+    Warn "will often be wrong. Add the free keys any time: setup.cmd configure"
+  }
+  return @("auto", $brave, $tavily, $serpapi)
+}
+
+# Download size in GB of a catalog model; 0 if unknown.
+function Get-ModelSize([string]$tag) {
+  foreach ($c in Get-Catalog) { if ($c[0] -eq $tag) { return $c[1] } }
+  return 0
+}
+
+# The best vision chat model and coding model that each fit fully in $budget
+# GB of GPU memory, with 20% room for context. Only one is loaded at a time.
+# The 24 GB pair is the one tested (Chat 14 of 14 test questions right,
+# searching as needed); the others are the same families, larger or smaller.
+# Dense qwen3-vl:32b is left out: several times slower than the 30b-a3b
+# models for chat. Keep in sync with recommended_pair in setup.sh.
+function Get-RecommendedPair([double]$budget) {
+  if ($budget -ge 172) { return @("qwen3-vl:235b-a22b-instruct", "qwen3-coder:30b-a3b-q8_0") }
+  if ($budget -ge 40) { return @("qwen3-vl:30b-a3b-instruct-q8_0", "qwen3-coder:30b-a3b-q8_0") }
+  if ($budget -ge 23.5) { return @("qwen3-vl:30b-a3b-instruct", "qwen3-coder:30b") }
+  if ($budget -ge 11.8) { return @("qwen3-vl:8b-instruct-q8_0", "qwen2.5-coder:14b") }
+  if ($budget -ge 7.3) { return @("qwen3-vl:8b-instruct", "qwen2.5-coder:7b") }
+  if ($budget -ge 4) { return @("qwen3-vl:4b-instruct", "qwen2.5-coder:3b") }
+  return @("qwen3-vl:2b-instruct", "qwen2.5-coder:3b")
+}
+
+# Recommended models for this PC. Returns @(chat, code).
+function Recommend-Models {
+  $mem = Get-MemoryBudget
+  $pair = Get-RecommendedPair $mem[0]
+  Say "Detected: $($mem[1])."
+  Say "You get the best pair that runs fully on it, shown in the chat menu as:"
+  Write-Host ""
+  Write-Host "    Chat  " -ForegroundColor White -NoNewline; Write-Host "$($pair[0])  " -NoNewline; Write-Host "($(Get-ModelSize $pair[0]) GB)" -ForegroundColor DarkGray
+  Note "          everyday questions; looks things up on the web; reads photos,"
+  Note "          screenshots and camera pictures"
+  Write-Host "    Code  " -ForegroundColor White -NoNewline; Write-Host "$($pair[1])  " -NoNewline; Write-Host "($(Get-ModelSize $pair[1]) GB)" -ForegroundColor DarkGray
+  Note "          writing, explaining and fixing code"
+  Write-Host ""
+  Say "Why just two: only one model fits in memory at a time, each is a big"
+  Say "download, and these were picked because they use web search reliably."
+  Say "Other models you already have stay on disk, hidden from the menu (show"
+  Say "them in Open WebUI: Admin Panel > Settings > Models)."
+  return $pair
+}
+
+# GPU memory settings for the recommended models. Returns @(ctx, fa, kv, keepAlive).
+function Recommended-Memory([string]$chat, [string]$code) {
+  $budget = (Get-MemoryBudget)[0]
+  $largest = [math]::Max((Get-ModelSize $chat), (Get-ModelSize $code))
+  $ctx = Get-ContextSuggestion ($budget * 0.9 - $largest) "q4_0"
+  # Measured on a 24 GB NVIDIA GPU: qwen3-vl:30b-a3b-instruct with 65536
+  # tokens of 4-bit context uses 23.6 GB, all on the GPU.
+  if ($chat -eq "qwen3-vl:30b-a3b-instruct") { $ctx = 65536 }
+  if ($ctx -gt 65536) { $ctx = 65536 }
+  if ($ctx -lt 16384) { $ctx = 16384 }
+  # Unload after 5 idle minutes (Ollama's default), so games and other apps
+  # get the GPU back; the next reply then waits while it reloads.
+  return @("$ctx", "1", "q4_0", "5m")
+}
+
 function Configure-Search {
   $cur = EnvGet "WEB_SEARCH_ENGINE"
   if ($cur -eq "external") { $cur = "auto" }
@@ -711,17 +805,7 @@ function Configure-Search {
   $brave = EnvGet "BRAVE_SEARCH_API_KEY"
   $tavily = EnvGet "TAVILY_API_KEY"
   $serpapi = EnvGet "SERPAPI_API_KEY"
-  Say "Web search lets the model look things up instead of guessing from"
-  Say "training data that is months or years old. It's what makes answers about"
-  Say "new software, products, prices and news right."
-  Write-Host ""
-  Write-Host "  Recommended: two free accounts, about 5 minutes." -ForegroundColor White
-  Write-Host "    Tavily    " -ForegroundColor White -NoNewline; Write-Host "search built for AI; returns the useful part of each page"
-  Write-Host "    SerpAPI   " -ForegroundColor White -NoNewline; Write-Host "Google results"
-  Say "Auto uses Tavily, switches to SerpAPI if Tavily fails or runs out of"
-  Say "searches, then to DuckDuckGo. DuckDuckGo needs no account but often"
-  Say "returns weak results, and answers suffer for it."
-  Note "Only the search terms the model writes are sent; your chats stay here."
+  Show-SearchWhy
   Write-Host ""
   $engine = Choose "Web search" $cur @(
     "auto|Auto (recommended)|Tavily, then SerpAPI, then DuckDuckGo",
@@ -761,12 +845,33 @@ function Configure {
   Note "A private ChatGPT-style assistant on your own hardware."
   if ($script:Ui) { Note "Use the arrow keys and Enter to choose, Space to tick boxes. Ctrl+C quits." }
   Note "Nothing changes until you confirm at the end."
+  Write-Host ""
+  Write-Host "  Recommended" -ForegroundColor White -NoNewline; Write-Host " sets everything up the way this project was tuned and tested:"
+  Say "  - the best vision chat model and coding model for your GPU,"
+  Say "    shown as ""Chat"" and ""Code"""
+  Say "  - web search on for every chat, with two free search accounts"
+  Say "  - GPU memory settings that fit the model and room for whole web pages"
+  Say "  - memory of facts you mention (your city, projects, preferences)"
+  Say "It asks only where models go, for the search keys and about remote access."
+  Write-Host ""
+  $styleDef = EnvGet "SETUP_STYLE"; if (-not $styleDef) { $styleDef = "recommended" }
+  $style = Choose "Setup" $styleDef @(
+    "recommended|Recommended|tested models and settings; a few questions",
+    "custom|Custom|pick every model and setting yourself")
+  $rec = ($style -eq "recommended")
+  $script:StepN = 0; $script:StepTotal = 4; if (-not $rec) { $script:StepTotal = 7 }
 
-  Step "1 of 7 $($script:Dot) Ollama"
-  $cur = EnvGet "OLLAMA_MODE"
-  $mode = Choose "How should Ollama run?" $cur @(
-    "native|Ollama app for Windows (recommended)|simplest; uses NVIDIA and AMD GPUs automatically",
-    "container|Inside Docker|only if you want everything in Docker; NVIDIA or CPU")
+  NStep "Ollama"
+  $mode = "native"
+  if ($rec) {
+    Say "Ollama runs as the Ollama app for Windows: simplest, and it uses NVIDIA"
+    Say "and AMD GPUs automatically."
+  } else {
+    $cur = EnvGet "OLLAMA_MODE"
+    $mode = Choose "How should Ollama run?" $cur @(
+      "native|Ollama app for Windows (recommended)|simplest; uses NVIDIA and AMD GPUs automatically",
+      "container|Inside Docker|only if you want everything in Docker; NVIDIA or CPU")
+  }
   $hw = ""
   if ($mode -eq "container") {
     $hw = EnvGet "COMPOSE_PROFILES"
@@ -781,22 +886,34 @@ function Configure {
       "ollama-cpu|CPU only|works, but slowly$dc")
   }
 
-  Step "2 of 7 $($script:Dot) Models"
+  NStep "Models"
   $modelsDir = Pick-ModelFolder (EnvGet "OLLAMA_MODELS") $mode
   Write-Host ""
-  $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
+  $chat = ""; $code = ""
+  if ($rec) {
+    $pair = Recommend-Models
+    $chat = $pair[0]; $code = $pair[1]; $models = "$chat $code"
+  } else {
+    $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
+  }
 
-  Step "3 of 7 $($script:Dot) Web search"
-  $search = Configure-Search
+  NStep "Web search"
+  if ($rec) { $search = Recommended-Search } else { $search = Configure-Search }
   $searchOn = ($search[0] -ne "off")
 
-  Step "4 of 7 $($script:Dot) GPU memory"
-  $memory = Configure-Memory $models $searchOn
+  if ($rec) {
+    $memory = Recommended-Memory $chat $code
+    $keep = $memory[3]
+  } else {
+    NStep "GPU memory"
+    $memory = Configure-Memory $models $searchOn
+    $keep = EnvGet "OLLAMA_KEEP_ALIVE"
+  }
   # Whole pages give better answers but need room: 4 pages plus the chat.
   $bypass = "false"; $results = "5"
   if ($searchOn -and $memory[0] -and [int]$memory[0] -ge 65536) { $bypass = "true"; $results = "4" }
 
-  Step "5 of 7 $($script:Dot) Remote access"
+  NStep "Remote access"
   Say "Tailscale lets your phone and laptop reach this PC from anywhere at"
   Say "https://<pc-name>.<tailnet>.ts.net, without exposing it to your Wi-Fi"
   Say "network or the internet. It's free for personal use: create an account at"
@@ -807,25 +924,33 @@ function Configure {
   $ts = "false"
   if (YesNo "Set up Tailscale remote access?" $tsDef) { $ts = "true" }
 
-  Step "6 of 7 $($script:Dot) Cloud models (optional)"
-  $cloud = Configure-Cloud
+  if ($rec) {
+    # Keep earlier answers to the Custom-only questions; defaults otherwise.
+    $cloud = @((EnvGet "OPENAI_API_BASE_URLS"), (EnvGet "OPENAI_API_KEYS"))
+    $port = EnvGet "OPEN_WEBUI_PORT"
+    $persist = "false"
+    $apiKeys = "false"; if ((EnvGet "ENABLE_API_KEYS") -eq "true") { $apiKeys = "true" }
+  } else {
+    NStep "Cloud models (optional)"
+    $cloud = Configure-Cloud
 
-  Step "7 of 7 $($script:Dot) Final details"
-  Say "Open WebUI listens on this PC only (127.0.0.1). Keep 3000 unless another"
-  Say "app uses it."
-  do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
-  Write-Host ""
-  $pcDef = "false"
-  if ((EnvGet "ENABLE_PERSISTENT_CONFIG") -eq "true") { $pcDef = "true" }
-  $persist = Choose "Where should settings live?" $pcDef @(
-    "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start",
-    "true|Admin Panel|.env only sets things up once; then manage settings in the web UI")
-  Write-Host ""
-  Note "API keys let scripts and tools use Open WebUI as your account."
-  $akDef = "n"
-  if ((EnvGet "ENABLE_API_KEYS") -eq "true") { $akDef = "y" }
-  $apiKeys = "false"
-  if (YesNo "Allow API keys? (only needed for scripts and tools)" $akDef) { $apiKeys = "true" }
+    NStep "Final details"
+    Say "Open WebUI listens on this PC only (127.0.0.1). Keep 3000 unless another"
+    Say "app uses it."
+    do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
+    Write-Host ""
+    $pcDef = "false"
+    if ((EnvGet "ENABLE_PERSISTENT_CONFIG") -eq "true") { $pcDef = "true" }
+    $persist = Choose "Where should settings live?" $pcDef @(
+      "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start",
+      "true|Admin Panel|.env only sets things up once; then manage settings in the web UI")
+    Write-Host ""
+    Note "API keys let scripts and tools use Open WebUI as your account."
+    $akDef = "n"
+    if ((EnvGet "ENABLE_API_KEYS") -eq "true") { $akDef = "y" }
+    $apiKeys = "false"
+    if (YesNo "Allow API keys? (only needed for scripts and tools)" $akDef) { $apiKeys = "true" }
+  }
 
   $searchText = $search[0]
   if ($search[0] -eq "auto") {
@@ -844,13 +969,23 @@ function Configure {
   if ($memory[1] -eq "1") { $ctxText = "$ctxText tokens, flash attention, $($memory[2]) cache" }
   $first = (($models -split "\s+") | Where-Object { $_ } | Select-Object -First 1)
   Step "Summary"
+  $styleText = "Custom"; if ($rec) { $styleText = "Recommended" }
+  Summary-Row "Setup" $styleText
   Summary-Row "Ollama" $modeText
-  $modelText = $models; if (-not $modelText) { $modelText = "(none)" }
-  Summary-Row "Models" $modelText
-  if ($first) { Summary-Row "Chats start with" $first }
+  if ($chat) {
+    Summary-Row "Chat" "$chat (new chats start here)"
+    Summary-Row "Code" $code
+  } else {
+    $modelText = $models; if (-not $modelText) { $modelText = "(none)" }
+    Summary-Row "Models" $modelText
+    if ($first) { Summary-Row "Chats start with" $first }
+  }
   Summary-Row "Model folder" $dirText
   Summary-Row "Context" $ctxText
   Summary-Row "Web search" $searchText
+  if ($keep -eq "-1") { Summary-Row "Model loading" "stays loaded, so replies start at once" }
+  elseif ($keep) { Summary-Row "Model loading" "unloads after $keep idle, freeing the GPU for games and apps" }
+  if ((EnvGet "ENABLE_MEMORY_BACKGROUND_REVIEW") -ne "false") { Summary-Row "Memory" "saves facts you mention, for later chats" }
   $tsText = "this PC only"; if ($ts -eq "true") { $tsText = "Tailscale (tailnet only)" }
   Summary-Row "Remote access" $tsText
   $cloudText = $cloud[0]; if (-not $cloudText) { $cloudText = "(none)" }
@@ -883,6 +1018,10 @@ function Configure {
   EnvSet "OLLAMA_CONTEXT_LENGTH" $memory[0]
   EnvSet "OLLAMA_FLASH_ATTENTION" $memory[1]
   EnvSet "OLLAMA_KV_CACHE_TYPE" $memory[2]
+  EnvSet "OLLAMA_KEEP_ALIVE" $keep
+  EnvSet "SETUP_STYLE" $style
+  EnvSet "CHAT_MODEL" $chat
+  EnvSet "CODE_MODEL" $code
   EnvSet "OPEN_WEBUI_PORT" $port
   EnvSet "TAILSCALE_SERVE" $ts
   EnvSet "OPENAI_API_BASE_URLS" $cloud[0]
@@ -1052,6 +1191,25 @@ function First-Admin([string]$port) {
   Ok "Open WebUI admin account exists"
 }
 
+# Names the recommended models "Chat" and "Code" in Open WebUI and hides the
+# others (scripts\model_menu.py; leaves models set up in the Admin Panel alone).
+function Setup-ModelMenu {
+  $chat = EnvGet "CHAT_MODEL"; $code = EnvGet "CODE_MODEL"
+  if (-not $chat -or -not $code) { return }
+  $py = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "scripts\model_menu.py"))
+  $ErrorActionPreference = "Continue"
+  $out = $py | & docker exec -i open-webui python3 - $chat $code 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    Warn "Couldn't set up the Chat and Code menu. Rename and hide models in Admin Panel > Settings > Models."
+    return
+  }
+  foreach ($line in @($out)) {
+    if (-not $line) { continue }
+    if ("$line" -like "skipped*") { Warn "Model menu: $line" } else { Ok "Model menu: $line" }
+  }
+  Ok "Model menu: Chat ($chat) and Code ($code)"
+}
+
 function Tailscale-Exe {
   if (Have "tailscale") { return "tailscale" }
   $p = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
@@ -1125,6 +1283,7 @@ function Apply {
   Check-GpuFit
 
   First-Admin $port
+  Setup-ModelMenu
 
   if ((EnvGet "TAILSCALE_SERVE") -eq "true") {
     Step "Remote access"

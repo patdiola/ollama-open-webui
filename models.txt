@@ -2,16 +2,28 @@
 # Any tag from https://ollama.com/library also works; enter it at the prompt.
 # Rough fit: the model needs about its size plus 20% in GPU memory (or Mac
 # unified memory). It runs on CPU and system RAM otherwise, but slowly.
+# Setup's Recommended choice picks a Chat + Code pair from the qwen3-vl and
+# coder lines below by memory; see recommended_pair in setup.sh / setup.ps1.
+qwen3-vl:2b-instruct|1.9|Chat for 4 GB or less: sees images, searches the web
+qwen2.5-coder:3b|1.9|Coding for 8 GB or less
 llama3.2:3b|2.0|Small and fast; OK on CPU-only machines
+qwen3-vl:4b-instruct|3.3|Chat for 4-7 GB: sees images, searches the web
 gemma3:4b|3.4|Small all-rounder; understands images
+qwen2.5-coder:7b|4.7|Coding for 8-12 GB
 qwen3:8b|5.2|Strong general model for 8 GB GPUs
 deepseek-r1:8b|5.2|Reasoning model; shows its thinking
+qwen3-vl:8b-instruct|6.1|Chat for 8-12 GB: sees images, searches the web
 gemma3:12b|8.2|All-rounder for 12-16 GB; understands images
+qwen2.5-coder:14b|9.0|Coding for 12-23 GB
 qwen3:14b|9.3|Stronger general model for 12-16 GB
+qwen3-vl:8b-instruct-q8_0|9.8|Chat for 12-23 GB: 8-bit, more exact than the 6 GB version
 gpt-oss:20b|13.8|OpenAI open-weight model; 16 GB+
 gemma3:27b|17.4|High quality; 24 GB GPU or 32 GB Mac
-qwen3-vl:30b-a3b-instruct|19.6|Recommended chat model for 24 GB: fast, sees images, reliable web search
 qwen3:30b-a3b-instruct-2507-q4_K_M|18.6|Text-only chat model for 24 GB: fast, answers without a thinking step
 qwen3:30b|18.6|Thinking model: reasons at length first; for hard problems, slow for chat
-qwen3-coder:30b|18.6|Coding; 24 GB GPU or 32 GB Mac
+qwen3-coder:30b|18.6|Coding for 24 GB GPU or 36 GB Mac
+qwen3-vl:30b-a3b-instruct|19.6|Chat for 24 GB GPU or 36 GB Mac: fast, sees images, reliable web search (tested)
+qwen3-coder:30b-a3b-q8_0|32.5|Coding for 48 GB+: 8-bit, more exact
+qwen3-vl:30b-a3b-instruct-q8_0|33.5|Chat for 48 GB+ (e.g. 64 GB Mac): 8-bit, more exact; sees images
 gpt-oss:120b|65.4|Large; 80 GB+ (e.g. Mac Studio with 96-128 GB)
+qwen3-vl:235b-a22b-instruct|143.3|Largest vision chat model; 256 GB+ Mac Studio

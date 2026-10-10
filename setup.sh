@@ -48,6 +48,9 @@ step() {
     "$CB$CC" "$*" "$C0" "$CD" "$C0"
 }
 
+# nstep "Title"  -> numbered step header, "N of $STEP_TOTAL · Title"
+nstep() { STEP_N=$((STEP_N + 1)); step "$STEP_N of $STEP_TOTAL · $1"; }
+
 # ask "Question" default  -> $REPLY
 ask() {
   local hint=""
@@ -342,8 +345,17 @@ offer_install() {  # offer_install "what" "command"
 detect_memory() {
   local gb vram
   if [ "$OS" = Darwin ]; then
+    # Unified memory is shared with macOS and apps. Models get the smaller of
+    # what macOS lets the GPU use (about 2/3 of RAM up to 36 GB, 3/4 above)
+    # and RAM minus a reserve for everything else (half up to 16 GB, else
+    # 8 GB or 15%, whichever is more).
     gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-    awk -v g="$gb" 'BEGIN { printf "%.0f|%d GB unified memory (about 70%% usable by the GPU)", g * 0.7, g }'
+    awk -v g="$gb" 'BEGIN {
+      cap = (g <= 36) ? g * 0.67 : g * 0.75
+      keep = (g <= 16) ? g / 2 : (g * 0.15 > 8 ? g * 0.15 : 8)
+      b = (g - keep < cap) ? g - keep : cap
+      printf "%.0f|%d GB unified memory: about %.0f GB for models, %.0f GB kept for macOS and apps", b, g, b, g - b
+    }'
     return
   fi
   if have nvidia-smi && vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null); then
@@ -691,7 +703,7 @@ search_key() {
     choose "$name key" "$def" \
       "open|Open the sign-up page|in your browser, then paste the key here" \
       "paste|Paste a key|I already have one" \
-      "skip|Skip for now|add it later with ./setup.sh configure"
+      "skip|Skip (not recommended)|add it later with ./setup.sh configure"
     case "$REPLY" in
       skip) REPLY=""; return 0 ;;
       open) open_url "$signup" && note "Opened $signup" || note "Open $signup in your browser." ;;
@@ -710,23 +722,104 @@ search_key() {
   done
 }
 
+# model_size TAG  -> download size in GB from models.txt (empty if unknown)
+model_size() { grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$1" '$1 == t { print $2 }'; }
+
+# recommended_pair BUDGET_GB  -> "chat code": the best vision chat model and
+# coding model that each fit fully in that much GPU (or unified) memory,
+# with 20% room for context. Only one is loaded at a time. The 24 GB pair is
+# the one tested (Chat 14 of 14 test questions right, searching as needed);
+# the others are the same families, larger or smaller. Dense qwen3-vl:32b is
+# left out: several times slower than the 30b-a3b models for chat.
+recommended_pair() {
+  awk -v b="$1" 'BEGIN {
+    if      (b >= 172) print "qwen3-vl:235b-a22b-instruct qwen3-coder:30b-a3b-q8_0"
+    else if (b >= 40)  print "qwen3-vl:30b-a3b-instruct-q8_0 qwen3-coder:30b-a3b-q8_0"
+    else if (b >= 23.5) print "qwen3-vl:30b-a3b-instruct qwen3-coder:30b"
+    else if (b >= 11.8) print "qwen3-vl:8b-instruct-q8_0 qwen2.5-coder:14b"
+    else if (b >= 7.3) print "qwen3-vl:8b-instruct qwen2.5-coder:7b"
+    else if (b >= 4)   print "qwen3-vl:4b-instruct qwen2.5-coder:3b"
+    else               print "qwen3-vl:2b-instruct qwen2.5-coder:3b"
+  }'
+}
+
+# Recommended models for this machine -> $CHAT, $CODE, $MODELS
+recommend_models() {
+  local mem budget desc
+  mem=$(detect_memory); budget=${mem%%|*}; desc=${mem#*|}
+  set -- $(recommended_pair "$budget"); CHAT=$1; CODE=$2; MODELS="$CHAT $CODE"
+  info "Detected: $desc."
+  info "You get the best pair that runs fully on it, shown in the chat menu as:"
+  printf '\n'
+  info "  ${CB}Chat${C0}  $CHAT  $CD($(model_size "$CHAT") GB)$C0"
+  note "        everyday questions; looks things up on the web; reads photos,"
+  note "        screenshots and camera pictures"
+  info "  ${CB}Code${C0}  $CODE  $CD($(model_size "$CODE") GB)$C0"
+  note "        writing, explaining and fixing code"
+  printf '\n'
+  info "Why just two: only one model fits in memory at a time, each is a big"
+  info "download, and these were picked because they use web search reliably."
+  info "Other models you already have stay on disk, hidden from the menu (show"
+  info "them in Open WebUI: Admin Panel > Settings > Models)."
+}
+
+# GPU memory settings for the recommended models -> $FA $KV $CTX $KEEP
+recommended_memory() {
+  local mem budget largest left
+  mem=$(detect_memory); budget=${mem%%|*}
+  FA=1; KV=q4_0
+  largest=$(printf '%s\n%s\n' "$(model_size "$CHAT")" "$(model_size "$CODE")" | sort -n | tail -n 1)
+  left=$(awk -v b="$budget" -v l="${largest:-0}" 'BEGIN { printf "%.1f", b * 0.9 - l }')
+  CTX=$(context_suggestion "$left" "$KV")
+  # Measured on a 24 GB NVIDIA GPU: qwen3-vl:30b-a3b-instruct with 65536
+  # tokens of 4-bit context uses 23.6 GB, all on the GPU.
+  [ "$OS" != Darwin ] && [ "$CHAT" = qwen3-vl:30b-a3b-instruct ] && CTX=65536
+  [ "$CTX" -gt 65536 ] && CTX=65536
+  [ "$CTX" -lt 16384 ] && CTX=16384
+  # Unload after 5 idle minutes (Ollama's default), so games and other apps
+  # get the GPU and memory back; the next reply then waits while it reloads.
+  KEEP=5m
+  return 0
+}
+
+# Web search with the two free accounts -> $SEARCH=auto, $TAVILY_KEY, $SERPAPI_KEY
+recommended_search() {
+  BRAVE_KEY=$(env_get BRAVE_SEARCH_API_KEY); TAVILY_KEY=$(env_get TAVILY_API_KEY); SERPAPI_KEY=$(env_get SERPAPI_API_KEY)
+  SEARCH=auto
+  search_why
+  search_key tavily; TAVILY_KEY=$REPLY
+  search_key serpapi; SERPAPI_KEY=$REPLY
+  if [ -z "$TAVILY_KEY$SERPAPI_KEY" ]; then
+    printf '\n'
+    warn "No keys yet, so search uses DuckDuckGo, and answers about anything recent"
+    warn "will often be wrong. Add the free keys any time: ./setup.sh configure"
+  fi
+}
+
+# Why web search and the two free accounts matter.
+search_why() {
+  info "A local model only knows what it learned in training, which ends months"
+  info "or years before today. With web search it looks things up first, so"
+  info "answers about new software, products, prices, weather and news are right."
+  printf '\n'
+  info "${CB}Two free accounts make search work well (about 5 minutes):${C0}"
+  info "  ${CB}Tavily${C0}    1,000 free searches a month; built for AI, returns the useful"
+  info "            part of each page"
+  info "  ${CB}SerpAPI${C0}   250 free searches a month; Google results, used when Tavily"
+  info "            fails or runs out"
+  info "A question takes 1 to 3 searches, so the free plans cover several hundred"
+  info "questions a month, plenty for a household. If both run out, search falls"
+  info "back to DuckDuckGo (no account, weaker results) until the month resets."
+  note "Only the search terms the model writes are sent; your chats stay here."
+}
+
 configure_search() {
   local cur
   cur=$(env_get WEB_SEARCH_ENGINE)
   [ "$cur" = external ] && cur=auto
   [ "$(env_get ENABLE_WEB_SEARCH)" = true ] || cur=off
   BRAVE_KEY=$(env_get BRAVE_SEARCH_API_KEY); TAVILY_KEY=$(env_get TAVILY_API_KEY); SERPAPI_KEY=$(env_get SERPAPI_API_KEY)
-  info "Web search lets the model look things up instead of guessing from"
-  info "training data that is months or years old. It's what makes answers about"
-  info "new software, products, prices and news right."
-  printf '\n'
-  info "${CB}Recommended: two free accounts, about 5 minutes.${C0}"
-  info "  ${CB}Tavily${C0}    search built for AI; returns the useful part of each page"
-  info "  ${CB}SerpAPI${C0}   Google results"
-  info "Auto uses Tavily, switches to SerpAPI if Tavily fails or runs out of"
-  info "searches, then to DuckDuckGo. DuckDuckGo needs no account but often"
-  info "returns weak results, and answers suffer for it."
-  note "Only the search terms the model writes are sent; your chats stay here."
+  search_why
   printf '\n'
   choose "Web search" "${cur:-auto}" \
     "auto|Auto (recommended)|Tavily, then SerpAPI, then DuckDuckGo" \
@@ -759,13 +852,28 @@ configure_search() {
 summary_row() { printf '  %s%-16s%s %s\n' "$CD" "$1" "$C0" "$2"; }
 
 configure() {
-  local profile="" detected port searchtext
+  local profile="" detected port searchtext style
   printf '\n  %sOpen WebUI + Ollama setup%s  %s%s%s\n' "$CB$CC" "$C0" "$CD" "$OS_NAME" "$C0"
   note "A private ChatGPT-style assistant on your own hardware."
   [ -n "$TTY_UI" ] && note "Use the arrow keys and Enter to choose, Space to tick boxes. Ctrl+C quits."
   note "Nothing changes until you confirm at the end."
+  printf '\n'
+  info "${CB}Recommended${C0} sets everything up the way this project was tuned and tested:"
+  info "  · the best vision chat model and coding model for your GPU or Mac,"
+  info "    shown as \"Chat\" and \"Code\""
+  info "  · web search on for every chat, with two free search accounts"
+  info "  · GPU memory settings that fit the model and room for whole web pages"
+  info "  · memory of facts you mention (your city, projects, preferences)"
+  info "It asks only where models go, for the search keys and about remote access."
+  printf '\n'
+  style=$(env_get SETUP_STYLE)
+  choose "Setup" "${style:-recommended}" \
+    "recommended|Recommended|tested models and settings; a few questions" \
+    "custom|Custom|pick every model and setting yourself"
+  STYLE=$REPLY
+  STEP_N=0; STEP_TOTAL=4; [ "$STYLE" = custom ] && STEP_TOTAL=7
 
-  step "1 of 7 · Ollama"
+  nstep "Ollama"
   if [ "$OS" = Darwin ]; then
     MODE=native
     info "On macOS, Ollama runs as a native app so it can use the GPU."
@@ -782,21 +890,27 @@ configure() {
     profile=$REPLY
   fi
 
-  step "2 of 7 · Models"
+  nstep "Models"
   pick_model_folder "$(env_get OLLAMA_MODELS)"
   printf '\n'
-  pick_models "$(env_get OLLAMA_PULL_MODELS)"
+  CHAT=""; CODE=""
+  if [ "$STYLE" = recommended ]; then recommend_models; else pick_models "$(env_get OLLAMA_PULL_MODELS)"; fi
 
-  step "3 of 7 · Web search"
-  configure_search
+  nstep "Web search"
+  if [ "$STYLE" = recommended ]; then recommended_search; else configure_search; fi
 
-  step "4 of 7 · GPU memory"
-  configure_memory "$( [ "$SEARCH" = off ] && echo false || echo true)"
+  if [ "$STYLE" = recommended ]; then
+    recommended_memory
+  else
+    nstep "GPU memory"
+    configure_memory "$( [ "$SEARCH" = off ] && echo false || echo true)"
+    KEEP=$(env_get OLLAMA_KEEP_ALIVE)
+  fi
   # Whole pages give better answers but need room: 4 pages plus the chat.
   BYPASS=false; RESULTS=5
   if [ "$SEARCH" != off ] && [ "${CTX:-0}" -ge 65536 ]; then BYPASS=true; RESULTS=4; fi
 
-  step "5 of 7 · Remote access"
+  nstep "Remote access"
   info "Tailscale lets your phone and laptop reach this machine from anywhere at"
   info "https://<pc-name>.<tailnet>.ts.net, without exposing it to your Wi-Fi"
   info "network or the internet. It's free for personal use: create an account at"
@@ -805,25 +919,32 @@ configure() {
   if yesno "Set up Tailscale remote access?" "$( [ "$(env_get TAILSCALE_SERVE)" = false ] && echo n || echo y)"; then
     TS=true; else TS=false; fi
 
-  step "6 of 7 · Cloud models (optional)"
-  configure_cloud
+  if [ "$STYLE" = recommended ]; then
+    # Keep earlier answers to the Custom-only questions; defaults otherwise.
+    CLOUD_URLS=$(env_get OPENAI_API_BASE_URLS); CLOUD_KEYS=$(env_get OPENAI_API_KEYS)
+    PORT=$(env_get OPEN_WEBUI_PORT); PERSIST=false
+    API_KEYS=$( [ "$(env_get ENABLE_API_KEYS)" = true ] && echo true || echo false)
+  else
+    nstep "Cloud models (optional)"
+    configure_cloud
 
-  step "7 of 7 · Final details"
-  info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
-  info "another app uses it."
-  while true; do
-    ask "Port" "$(env_get OPEN_WEBUI_PORT)"
-    case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
-  done
-  printf '\n'
-  choose "Where should settings live?" "$( [ "$(env_get ENABLE_PERSISTENT_CONFIG)" = true ] && echo true || echo false)" \
-    "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start" \
-    "true|Admin Panel|.env only sets things up once; then manage settings in the web UI"
-  PERSIST=$REPLY
-  printf '\n'
-  note "API keys let scripts and tools use Open WebUI as your account."
-  if yesno "Allow API keys? (only needed for scripts and tools)" "$( [ "$(env_get ENABLE_API_KEYS)" = true ] && echo y || echo n)"; then
-    API_KEYS=true; else API_KEYS=false; fi
+    nstep "Final details"
+    info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
+    info "another app uses it."
+    while true; do
+      ask "Port" "$(env_get OPEN_WEBUI_PORT)"
+      case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
+    done
+    printf '\n'
+    choose "Where should settings live?" "$( [ "$(env_get ENABLE_PERSISTENT_CONFIG)" = true ] && echo true || echo false)" \
+      "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start" \
+      "true|Admin Panel|.env only sets things up once; then manage settings in the web UI"
+    PERSIST=$REPLY
+    printf '\n'
+    note "API keys let scripts and tools use Open WebUI as your account."
+    if yesno "Allow API keys? (only needed for scripts and tools)" "$( [ "$(env_get ENABLE_API_KEYS)" = true ] && echo y || echo n)"; then
+      API_KEYS=true; else API_KEYS=false; fi
+  fi
 
   case "$SEARCH" in
     auto) searchtext="Auto: "
@@ -834,12 +955,23 @@ configure() {
     *)    searchtext=$SEARCH ;;
   esac
   step "Summary"
+  summary_row "Setup" "$( [ "$STYLE" = recommended ] && echo Recommended || echo Custom)"
   summary_row "Ollama" "$MODE${profile:+ ($profile)}"
-  summary_row "Models" "${MODELS:-(none)}"
-  [ -n "$MODELS" ] && summary_row "Chats start with" "${MODELS%% *}"
+  if [ -n "$CHAT" ]; then
+    summary_row "Chat" "$CHAT (new chats start here)"
+    summary_row "Code" "$CODE"
+  else
+    summary_row "Models" "${MODELS:-(none)}"
+    [ -n "$MODELS" ] && summary_row "Chats start with" "${MODELS%% *}"
+  fi
   summary_row "Model folder" "${MODELS_DIR:-$( [ "$MODE" = native ] && echo "Ollama's default" || echo "inside Docker")}"
   summary_row "Context" "${CTX:-Ollama default}$( [ "$FA" = 1 ] && echo " tokens, flash attention, $KV cache")"
   summary_row "Web search" "$searchtext"
+  case "$KEEP" in
+    -1) summary_row "Model loading" "stays loaded, so replies start at once" ;;
+    ?*) summary_row "Model loading" "unloads after $KEEP idle, freeing the GPU for games and apps" ;;
+  esac
+  [ "$(env_get ENABLE_MEMORY_BACKGROUND_REVIEW)" = false ] || summary_row "Memory" "saves facts you mention, for later chats"
   summary_row "Remote access" "$( [ "$TS" = true ] && echo 'Tailscale (tailnet only)' || echo 'this machine only')"
   summary_row "Cloud models" "${CLOUD_URLS:-(none)}"
   summary_row "Local URL" "http://localhost:$PORT"
@@ -868,6 +1000,10 @@ configure() {
   env_set OLLAMA_CONTEXT_LENGTH "$CTX"
   env_set OLLAMA_FLASH_ATTENTION "$FA"
   env_set OLLAMA_KV_CACHE_TYPE "$KV"
+  env_set OLLAMA_KEEP_ALIVE "$KEEP"
+  env_set SETUP_STYLE "$STYLE"
+  env_set CHAT_MODEL "$CHAT"
+  env_set CODE_MODEL "$CODE"
   env_set OPEN_WEBUI_PORT "$PORT"
   env_set TAILSCALE_SERVE "$TS"
   env_set OPENAI_API_BASE_URLS "$CLOUD_URLS"
@@ -1066,6 +1202,24 @@ first_admin() {
   ok "Open WebUI admin account exists"
 }
 
+# Names the recommended models "Chat" and "Code" in Open WebUI and hides the
+# others (scripts/model_menu.py; leaves models set up in the Admin Panel alone).
+setup_model_menu() {
+  local chat code out line
+  chat=$(env_get CHAT_MODEL); code=$(env_get CODE_MODEL)
+  [ -n "$chat" ] && [ -n "$code" ] || return 0
+  if ! out=$(docker exec -i open-webui python3 - "$chat" "$code" < scripts/model_menu.py 2>/dev/null); then
+    warn "Couldn't set up the Chat and Code menu. Rename and hide models in Admin Panel > Settings > Models."
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in '') ;; skipped*) warn "Model menu: $line" ;; *) ok "Model menu: $line" ;; esac
+  done <<EOF
+$out
+EOF
+  ok "Model menu: Chat ($chat) and Code ($code)"
+}
+
 tailscale_bin() {
   if have tailscale; then echo tailscale
   elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
@@ -1143,6 +1297,7 @@ apply() {
   check_gpu_fit
 
   first_admin "$port"
+  setup_model_menu
 
   TS_URL=""
   if [ "$(env_get TAILSCALE_SERVE)" = true ]; then

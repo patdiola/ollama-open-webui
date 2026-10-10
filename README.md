@@ -60,11 +60,12 @@ Notes:
 | Setting | Default | Notes |
 | --- | --- | --- |
 | Ollama mode / hardware | per OS | see above |
-| Models | none | picked from [`models.txt`](models.txt) or any [Ollama tag](https://ollama.com/library); setup marks what fits your memory |
+| Setup style | Recommended | the tested setup in a few questions: everything in this table set for your hardware. **Custom** asks about every setting |
+| Models | Chat + Code | Recommended picks the best vision chat model (reads photos, screenshots and camera pictures) and coding model that run fully on your GPU or Mac, shown as "Chat" and "Code"; other models are hidden from the menu. Macs keep at least 8 GB (half up to 16 GB) for macOS and apps. Custom: any of [`models.txt`](models.txt) or any [Ollama tag](https://ollama.com/library) |
 | Port | 3000 | always bound to `127.0.0.1` |
 | Tailscale remote access | on | tailnet only; never Funnel |
 | Cloud models | off | OpenAI, OpenRouter, or any OpenAI-compatible API. Chats sent to them leave your machine |
-| Web search | on, auto | Tavily → SerpAPI → DuckDuckGo, switching automatically when one fails or runs out. Setup walks you through two free accounts (Tavily, SerpAPI) and checks the keys; without them it uses DuckDuckGo. `off` for no web access |
+| Web search | on, auto | Tavily → SerpAPI → DuckDuckGo, switching automatically when one fails or runs out. Setup walks you through two free accounts (Tavily: 1,000 searches a month, SerpAPI: 250; plenty for a household) and checks the keys; without them it uses DuckDuckGo. `off` for no web access |
 | Memory | on | after each message the chat model saves lasting facts about you (city, projects, preferences) and adds them to new chats. Stored only on this machine; see or delete them in Settings → Personalization → Memory |
 | Settings source | `.env` | `.env` re-applied on every start; or let the Admin Panel own them |
 
