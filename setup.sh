@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 ENV_FILE=.env
 OLLAMA_SERVICES="ollama-cpu ollama-nvidia ollama-amd"
-OLLAMA_TUNING="OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE"
+OLLAMA_TUNING="OLLAMA_MODELS OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE"
 
 # ------------------------------------------------------------------ helpers
 
@@ -213,6 +213,117 @@ detect_profile() {
 
 # ------------------------------------------------------------- configure
 
+# A setting the running native Ollama uses (macOS), from its server log. The
+# Ollama app has its own settings (model location, context length) that it
+# passes to the server, which can win over .env.
+ollama_in_use() {
+  local log="$HOME/.ollama/logs/server.log"
+  [ "$OS" = Darwin ] && [ -f "$log" ] || return 1
+  awk -v k="$1:" '(i = index($0, k)) {
+    s = substr($0, i + length(k)); j = index(s, " OLLAMA_")
+    v = j ? substr(s, 1, j - 1) : s; found = 1
+  } END { if (!found) exit 1; print v }' "$log"
+}
+
+# Warns when native Ollama doesn't use a setting from .env.
+check_ollama_settings() {
+  local k want have bad=""
+  for k in $OLLAMA_TUNING; do
+    want=$(env_get "$k")
+    [ -n "$want" ] || continue
+    have=$(ollama_in_use "$k") || return 0
+    [ "$k" = OLLAMA_FLASH_ATTENTION ] && { [ "$want" = 1 ] && want=true; [ "$want" = 0 ] && want=false; }
+    [ "${have%/}" = "${want%/}" ] || bad="$bad
+      $k is '$have', .env says '$want'"
+  done
+  [ -n "$bad" ] || return 0
+  warn "Ollama isn't using some settings from .env:$bad"
+  info "The Ollama app's own Settings (Model location, Context length) can"
+  info "override them. Change those there to match, then quit and reopen Ollama."
+}
+
+# Folders holding Ollama models (home folder, plus external drives), so
+# existing downloads can be reused.
+find_model_stores() {
+  local roots="$HOME" r
+  if [ "$OS" = Darwin ]; then roots="$roots /Volumes"; else roots="$roots /usr/share/ollama /media /srv"; fi
+  # /mnt holds the Windows drives under WSL; searching them is very slow.
+  grep -qi microsoft /proc/version 2>/dev/null || roots="$roots /mnt"
+  for r in $roots; do
+    [ -d "$r" ] || continue
+    find "$r" -maxdepth 5 \( -name Library -o -name node_modules -o -name .git -o -name .cache \) -prune \
+      -o -type d -name manifests -print 2>/dev/null || true
+  done | while IFS= read -r d; do
+    [ -d "${d%/manifests}/blobs" ] && echo "${d%/manifests}"
+  done | sort -u
+}
+
+# Model names (name:tag) in an Ollama models folder.
+store_models() {
+  [ -d "$1/manifests" ] || return 0
+  find "$1/manifests" -type f 2>/dev/null | awk -v p="$1/manifests/" '{
+    s = substr($0, length(p) + 1)
+    sub(/^registry\.ollama\.ai\/library\//, "", s); sub(/^registry\.ollama\.ai\//, "", s)
+    n = split(s, a, "/"); name = a[1]
+    for (i = 2; i < n; i++) name = name "/" a[i]
+    print name ":" a[n]
+  }'
+}
+
+# Asks where Ollama keeps models -> $MODELS_DIR ("" for Ollama's default).
+pick_model_folder() {
+  local current="$1" default="" in_use="" list="" d i names count gb
+  # macOS runs Ollama natively; Linux runs it in Docker.
+  if [ "$OS" = Darwin ]; then
+    default="$HOME/.ollama/models"
+    in_use=$(ollama_in_use OLLAMA_MODELS | sed 's#/*$##') || in_use=""
+  fi
+  info "Searching this computer for models Ollama already downloaded..."
+  list=$( { [ -n "$default" ] && echo "$default"; [ -n "$in_use" ] && echo "$in_use"; [ -n "$current" ] && echo "$current"; find_model_stores; } \
+    | sed 's#/*$##' | awk 'NF && !seen[$0]++')
+  i=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    printf '   %2d) %s%s\n' "$i" "$d" "$( [ "$d" = "$in_use" ] && echo "  (Ollama uses this now)" || { [ "$d" = "$default" ] && echo "  (Ollama's default)"; })"
+    names=$(store_models "$d")
+    if [ -n "$names" ]; then
+      count=$(printf '%s\n' "$names" | wc -l | tr -d ' ')
+      gb=$(du -sk "$d/blobs" 2>/dev/null | awk '{ printf "%.0f", $1 / 1048576 }')
+      info "      $count models, ${gb:-0} GB: $(printf '%s\n' "$names" | head -n 4 | paste -sd, - | sed 's/,/, /g')$( [ "$count" -gt 4 ] && echo ", ...")"
+    else
+      info "      no models yet"
+    fi
+  done <<EOF
+$list
+EOF
+  info "Free space in your home folder: $(df -Pk "$HOME" | awk 'NR == 2 { printf "%.0f GB", $4 / 1048576 }')"
+  info ""
+  info "Models take 2-65 GB each, so pick a drive with room. Picking a folder"
+  info "that already has models means those won't be downloaded again."
+  if [ -z "$default" ]; then
+    info "Enter a number or a folder path, or press Enter with nothing to keep"
+    info "models inside Docker."
+  else
+    info "Enter a number or a folder path (created if missing)."
+  fi
+  while true; do
+    ask "Model folder" "${current:-${in_use:-$default}}"
+    d=$REPLY
+    case "$d" in "~"/*) d="$HOME/${d#"~"/}" ;; esac
+    d=$(printf '%s' "$d" | sed 's#/*$##')
+    case "$d" in
+      *[!0-9]*|'') ;;
+      *) d=$(printf '%s\n' "$list" | sed -n "${d}p") ;;
+    esac
+    if [ -z "$d" ] && [ -z "$default" ]; then MODELS_DIR=""; return 0; fi
+    case "$d" in /*) break ;; esac
+    warn "Enter a number from the list or a full path like /Volumes/Big/ollama."
+  done
+  [ "$d" = "$default" ] && d=""
+  MODELS_DIR=$d
+}
+
 pick_models() {
   local current="$1" mem budget desc i=0 tag size note fit choice out=""
   mem=$(detect_memory); budget=${mem%%|*}; desc=${mem#*|}
@@ -244,7 +355,7 @@ pick_models() {
 
 # Suggests GPU memory settings, leaving headroom for context and other apps.
 configure_memory() {
-  local mem budget m size largest=0 largest_tag="" left suggest def
+  local mem budget m size largest=0 largest_tag="" left suggest def d
   mem=$(detect_memory); budget=${mem%%|*}
   for m in $MODELS; do
     size=$(grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$m" '$1 == t { print $2 }')
@@ -261,6 +372,7 @@ configure_memory() {
   info "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
   info "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
   info "show 100% GPU while a model is loaded."
+  d=$(ollama_in_use OLLAMA_CONTEXT_LENGTH) && [ -n "$d" ] && info "  Ollama uses now:   $d tokens"
   def=$(env_get OLLAMA_CONTEXT_LENGTH); [ -n "$def" ] || def=$suggest
   while true; do
     ask "Context length in tokens" "$def"
@@ -378,6 +490,8 @@ configure() {
   fi
 
   step "2/7  Models"
+  pick_model_folder "$(env_get OLLAMA_MODELS)"
+  info ""
   pick_models "$(env_get OLLAMA_PULL_MODELS)"
 
   step "3/7  GPU memory"
@@ -421,6 +535,7 @@ configure() {
   step "Summary"
   info "Ollama:        $MODE${profile:+ ($profile)}"
   info "Models:        ${MODELS:-(none)}"
+  info "Model folder:  ${MODELS_DIR:-$( [ "$MODE" = native ] && echo "Ollama's default" || echo "inside Docker")}"
   info "Context:       ${CTX:-Ollama default}$( [ "$FA" = 1 ] && echo " tokens, flash attention, $KV cache")"
   info "Local URL:     http://localhost:$PORT"
   info "Tailscale:     $TS"
@@ -444,6 +559,7 @@ configure() {
     env_set OLLAMA_BASE_URL "http://host.docker.internal:11434"
   fi
   env_set OLLAMA_PULL_MODELS "$MODELS"
+  env_set OLLAMA_MODELS "$MODELS_DIR"
   env_set OLLAMA_CONTEXT_LENGTH "$CTX"
   env_set OLLAMA_FLASH_ATTENTION "$FA"
   env_set OLLAMA_KV_CACHE_TYPE "$KV"
@@ -514,12 +630,13 @@ check_native_ollama() {
 # in .env removes them) and restart Ollama if one changed. Linux: the
 # settings belong in the ollama systemd service.
 sync_native_ollama_env() {
-  local k want changed="" i
+  local k want="" changed="" i
   if [ -n "$(env_get OLLAMA_KV_CACHE_TYPE)" ] && [ "$(env_get OLLAMA_FLASH_ATTENTION)" != 1 ]; then
     warn "OLLAMA_KV_CACHE_TYPE only works with OLLAMA_FLASH_ATTENTION=1."
   fi
   if [ "$OS" != Darwin ]; then
-    if [ -n "$(env_get OLLAMA_CONTEXT_LENGTH)$(env_get OLLAMA_FLASH_ATTENTION)$(env_get OLLAMA_KV_CACHE_TYPE)" ]; then
+    for k in $OLLAMA_TUNING; do want="$want$(env_get "$k")"; done
+    if [ -n "$want" ]; then
       warn "Native Ollama on Linux doesn't read .env. Add the OLLAMA_* settings to its service: $SUDO systemctl edit ollama"
     fi
     return 0
@@ -586,11 +703,13 @@ wait_webui() {
 first_admin() {
   local port=$1
   curl -fsS -m 5 "http://127.0.0.1:$port/api/config" 2>/dev/null | grep -q '"onboarding":true' || return 0
-  step "Create your admin account"
-  info "No accounts exist yet. The first account becomes the admin, and"
-  info "sign-ups close after that. Create it now, before remote access is on."
-  info "The email is only a login name (Open WebUI never sends mail), and the"
-  info "password protects every account, so use a strong one and save it in a"
+  step "Create your Open WebUI admin account"
+  info "Open WebUI (the chat website) has no accounts yet. This is a new login"
+  info "stored only on this computer, not your Tailscale, Docker or Ollama account."
+  info "The first account becomes the admin and sign-ups close after that; you"
+  info "add family members later. Create it now, before remote access is on."
+  info "The email is only a login name (Open WebUI never sends mail). The admin"
+  info "password guards everyone's chats, so use a strong one and save it in a"
   info "password manager. There's no 'forgot password' link."
   info ""
   if [ "$OS" = Linux ] && [ -n "${SSH_CONNECTION:-}" ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
@@ -602,12 +721,12 @@ first_admin() {
     [ "$OS" = Darwin ] && open "http://localhost:$port" 2>/dev/null || true
   fi
   while true; do
-    ask "Press Enter when the admin account exists (or type 'skip')" ""
-    [ "$REPLY" = skip ] && { warn "Skipped. Create the admin account before sharing access."; return 0; }
+    ask "Press Enter when the Open WebUI admin account exists (or type 'skip')" ""
+    [ "$REPLY" = skip ] && { warn "Skipped. Create the Open WebUI admin account before sharing access."; return 0; }
     curl -fsS -m 5 "http://127.0.0.1:$port/api/config" | grep -q '"onboarding":true' || break
     warn "No account yet."
   done
-  ok "Admin account exists"
+  ok "Open WebUI admin account exists"
 }
 
 tailscale_bin() {
@@ -656,7 +775,7 @@ apply() {
 
   step "Checking prerequisites"
   check_docker
-  if [ "$mode" = native ]; then sync_native_ollama_env; check_native_ollama; else check_gpu_runtime "$profile"; fi
+  if [ "$mode" = native ]; then sync_native_ollama_env; check_native_ollama; check_ollama_settings; else check_gpu_runtime "$profile"; fi
 
   step "Starting containers"
   # Remove an Ollama container from a previously chosen profile.

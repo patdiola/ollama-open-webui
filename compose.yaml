@@ -12,8 +12,13 @@ x-ollama: &ollama
     OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-}
     OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-}
     OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE:-}
+    # Set only when .env picks a folder on this computer for models.
+    OLLAMA_MODELS: ${OLLAMA_MODELS:+/models}
   volumes:
     - ollama-models:/root/.ollama
+    # OLLAMA_MODELS folder from .env. Without one, this mounts the volume
+    # above a second time and goes unused.
+    - ${OLLAMA_MODELS:-ollama-models}:/models
   networks:
     default:
       aliases: [ollama]

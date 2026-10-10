@@ -16,7 +16,7 @@ Set-Location -LiteralPath $PSScriptRoot
 $EnvFile = Join-Path $PSScriptRoot ".env"
 $ExampleFile = Join-Path $PSScriptRoot ".env.example"
 $OllamaServices = @("ollama-cpu", "ollama-nvidia", "ollama-amd")
-$OllamaTuning = @("OLLAMA_CONTEXT_LENGTH", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE")
+$OllamaTuning = @("OLLAMA_MODELS", "OLLAMA_CONTEXT_LENGTH", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE")
 $script:TsUrl = ""
 
 # ------------------------------------------------------------------ helpers
@@ -173,6 +173,137 @@ function Get-Catalog {
   return $list
 }
 
+# A setting the running native Ollama uses, from its server log; $null if
+# unknown. The Ollama app has its own settings (model location, context
+# length) that it passes to the server, which can win over .env.
+function Get-OllamaInUse([string]$key) {
+  $log = Join-Path $env:LOCALAPPDATA "Ollama\server.log"
+  try { $m = Select-String -LiteralPath $log -Pattern "${key}:(.*?) OLLAMA_" -ErrorAction Stop | Select-Object -Last 1 }
+  catch { return $null }
+  if (-not $m) { return $null }
+  return $m.Matches[0].Groups[1].Value.Replace("\\", "\")
+}
+
+# Warns when native Ollama doesn't use a setting from .env.
+function Check-OllamaSettings {
+  $bad = @()
+  foreach ($k in $OllamaTuning) {
+    $want = EnvGet $k
+    if (-not $want) { continue }
+    $have = Get-OllamaInUse $k
+    if ($null -eq $have) { return }
+    if ($k -eq "OLLAMA_FLASH_ATTENTION") { if ($want -eq "1") { $want = "true" } elseif ($want -eq "0") { $want = "false" } }
+    if ($have.TrimEnd("\") -ne $want.TrimEnd("\")) { $bad += "$k is '$have', .env says '$($want)'" }
+  }
+  if ($bad.Count -eq 0) { return }
+  Warn "Ollama isn't using some settings from .env:"
+  foreach ($b in $bad) { Say "      $b" }
+  Say "The Ollama app's own Settings (Model location, Context length) can"
+  Say "override them. Change those there to match, then quit and reopen Ollama."
+}
+
+# Folders holding Ollama models, up to 4 levels deep on each fixed drive
+# (skipping system folders), so existing downloads can be reused.
+function Find-ModelStores {
+  $skip = @("Windows", "Program Files", "Program Files (x86)", "ProgramData", "`$Recycle.Bin",
+    "System Volume Information", "Recovery", "AppData", "node_modules", ".git")
+  $found = New-Object System.Collections.ArrayList
+  function Walk([string]$dir, [int]$depth) {
+    if ((Test-Path -LiteralPath (Join-Path $dir "manifests")) -and (Test-Path -LiteralPath (Join-Path $dir "blobs"))) {
+      [void]$found.Add($dir); return
+    }
+    if ($depth -le 0) { return }
+    foreach ($sub in [IO.Directory]::EnumerateDirectories($dir)) {
+      if ($skip -contains [IO.Path]::GetFileName($sub)) { continue }
+      try { Walk $sub ($depth - 1) } catch { }
+    }
+  }
+  foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+    if ($drive.DriveType -ne "Fixed" -or -not $drive.IsReady) { continue }
+    try { Walk $drive.RootDirectory.FullName 4 } catch { }
+  }
+  return $found
+}
+
+# Model names (name:tag) in an Ollama models folder.
+function Get-StoreModels([string]$dir) {
+  $root = Join-Path $dir "manifests"
+  if (-not (Test-Path -LiteralPath $root)) { return @() }
+  $names = @()
+  foreach ($f in Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue) {
+    $parts = $f.FullName.Substring($root.Length + 1).Split("\")
+    if ($parts.Count -lt 2) { continue }
+    $name = $parts[0..($parts.Count - 2)] -join "/"
+    $name = $name -replace "^registry\.ollama\.ai/library/", "" -replace "^registry\.ollama\.ai/", ""
+    $names += "$name`:$($parts[-1])"
+  }
+  return $names
+}
+
+function Get-FolderGb([string]$dir) {
+  $blobs = Join-Path $dir "blobs"
+  if (-not (Test-Path -LiteralPath $blobs)) { return 0 }
+  $sum = (Get-ChildItem -LiteralPath $blobs -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+  return [math]::Round($sum / 1GB)
+}
+
+# Asks where Ollama keeps models. Returns "" for Ollama's default.
+function Pick-ModelFolder([string]$current, [string]$mode) {
+  $default = Join-Path $HOME ".ollama\models"
+  $inUse = ""
+  if ($mode -eq "native") { $inUse = "$(Get-OllamaInUse "OLLAMA_MODELS")".TrimEnd("\") }
+  Say "Searching this PC for models Ollama already downloaded..."
+  $list = @()
+  $candidates = @($current) + @(Find-ModelStores)
+  if ($mode -eq "native") { $candidates = @($default, $inUse) + $candidates }
+  foreach ($d in $candidates) {
+    if (-not $d) { continue }
+    $d = $d.TrimEnd("\")
+    if ($list -notcontains $d) { $list += $d }
+  }
+  for ($i = 0; $i -lt $list.Count; $i++) {
+    $d = $list[$i]
+    $note = ""
+    if ($d -eq $default) { $note = "  (Ollama's default)" }
+    if ($d -eq $inUse) { $note = "  (Ollama uses this now)" }
+    Write-Host ("   {0}) {1}{2}" -f ($i + 1), $d, $note)
+    $names = @(Get-StoreModels $d)
+    if ($names.Count) {
+      $shown = ($names | Select-Object -First 4) -join ", "
+      if ($names.Count -gt 4) { $shown = "$shown, ..." }
+      Say "      $($names.Count) models, $(Get-FolderGb $d) GB: $shown"
+    } else { Say "      no models yet" }
+  }
+  $free = @()
+  foreach ($drive in [IO.DriveInfo]::GetDrives()) {
+    if ($drive.DriveType -eq "Fixed" -and $drive.IsReady) {
+      $free += "{0} {1:N0} GB" -f $drive.Name.TrimEnd("\"), ($drive.AvailableFreeSpace / 1GB)
+    }
+  }
+  Say "Free space: $($free -join ', ')"
+  Say ""
+  Say "Models take 2-65 GB each, so pick a drive with room. Picking a folder"
+  Say "that already has models means those won't be downloaded again."
+  if ($mode -eq "container") {
+    Say "Enter a number or a folder path, or press Enter with nothing to keep"
+    Say "models inside Docker."
+  } else {
+    Say "Enter a number or a folder path (created if missing)."
+  }
+  $def = $current
+  if (-not $def -and $mode -eq "native") { $def = $inUse }
+  if (-not $def -and $mode -eq "native") { $def = $default }
+  while ($true) {
+    $a = (Ask "Model folder" $def).Trim().Trim('"').TrimEnd("\")
+    if ($a -match "^\d+$" -and [int]$a -ge 1 -and [int]$a -le $list.Count) { $a = $list[[int]$a - 1] }
+    if (-not $a -and $mode -eq "container") { return "" }
+    if ($a -match "^[A-Za-z]:\\") { break }
+    Warn "Enter a number from the list or a full path like D:\Ollama Models."
+  }
+  if ($a -eq $default) { return "" }
+  return $a
+}
+
 function Pick-Models([string]$current) {
   $budget = Get-MemoryBudget
   Say "Detected: $($budget[1])"
@@ -225,6 +356,8 @@ function Configure-Memory([string]$models) {
   Say "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
   Say "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
   Say "show 100% GPU while a model is loaded."
+  $now = Get-OllamaInUse "OLLAMA_CONTEXT_LENGTH"
+  if ($now) { Say "  Ollama uses now:    $now tokens" }
   $def = EnvGet "OLLAMA_CONTEXT_LENGTH"
   if (-not $def) { $def = "$suggest" }
   do { $ctx = Ask "Context length in tokens" $def } until ($ctx -match "^\d+$")
@@ -339,6 +472,8 @@ function Configure {
   }
 
   Step "2/7  Models"
+  $modelsDir = Pick-ModelFolder (EnvGet "OLLAMA_MODELS") $mode
+  Say ""
   $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
 
   Step "3/7  GPU memory"
@@ -386,6 +521,9 @@ function Configure {
   $cloudText = $cloud[0]; if (-not $cloudText) { $cloudText = "(none)" }
   Say "Ollama:        $modeText"
   Say "Models:        $modelText"
+  $dirText = $modelsDir
+  if (-not $dirText) { $dirText = "Ollama's default"; if ($mode -eq "container") { $dirText = "inside Docker" } }
+  Say "Model folder:  $dirText"
   $ctxText = $memory[0]; if (-not $ctxText) { $ctxText = "Ollama default" }
   if ($memory[1] -eq "1") { $ctxText = "$ctxText tokens, flash attention, $($memory[2]) cache" }
   Say "Context:       $ctxText"
@@ -411,6 +549,7 @@ function Configure {
     EnvSet "OLLAMA_BASE_URL" "http://host.docker.internal:11434"
   }
   EnvSet "OLLAMA_PULL_MODELS" $models
+  EnvSet "OLLAMA_MODELS" $modelsDir
   EnvSet "OLLAMA_CONTEXT_LENGTH" $memory[0]
   EnvSet "OLLAMA_FLASH_ATTENTION" $memory[1]
   EnvSet "OLLAMA_KV_CACHE_TYPE" $memory[2]
@@ -532,21 +671,23 @@ function Test-Onboarding([string]$port) {
 
 function First-Admin([string]$port) {
   if (-not (Test-Onboarding $port)) { return }
-  Step "Create your admin account"
-  Say "No accounts exist yet. The first account becomes the admin, and"
-  Say "sign-ups close after that. Create it now, before remote access is on."
-  Say "The email is only a login name (Open WebUI never sends mail), and the"
-  Say "password protects every account, so use a strong one and save it in a"
+  Step "Create your Open WebUI admin account"
+  Say "Open WebUI (the chat website) has no accounts yet. This is a new login"
+  Say "stored only on this computer, not your Tailscale, Docker or Ollama account."
+  Say "The first account becomes the admin and sign-ups close after that; you"
+  Say "add family members later. Create it now, before remote access is on."
+  Say "The email is only a login name (Open WebUI never sends mail). The admin"
+  Say "password guards everyone's chats, so use a strong one and save it in a"
   Say "password manager. There's no 'forgot password' link."
   Say "Opening http://localhost:$port"
   Start-Process "http://localhost:$port"
   while ($true) {
-    $r = Read-Host "  Press Enter when the admin account exists (or type 'skip')"
-    if ($r -eq "skip") { Warn "Skipped. Create the admin account before sharing access."; return }
+    $r = Read-Host "  Press Enter when the Open WebUI admin account exists (or type 'skip')"
+    if ($r -eq "skip") { Warn "Skipped. Create the Open WebUI admin account before sharing access."; return }
     if (-not (Test-Onboarding $port)) { break }
     Warn "No account yet."
   }
-  Ok "Admin account exists"
+  Ok "Open WebUI admin account exists"
 }
 
 function Tailscale-Exe {
@@ -586,7 +727,7 @@ function Apply {
 
   Step "Checking prerequisites"
   Check-Docker
-  if ($mode -eq "native") { Sync-OllamaEnv; Check-NativeOllama }
+  if ($mode -eq "native") { Sync-OllamaEnv; Check-NativeOllama; Check-OllamaSettings }
 
   Step "Starting containers"
   # Remove an Ollama container from a previously chosen profile.
