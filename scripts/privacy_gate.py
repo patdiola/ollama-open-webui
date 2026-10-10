@@ -8,7 +8,7 @@ Modes:
   --all                    Scan the tree at HEAD and every commit in its
                            history. Used in CI.
 
-Standard library only. Fails closed: any finding or internal error blocks
+Standard library only, Python 3.8+. Fails closed: any finding or internal error blocks
 the push. Matched values are masked in output so CI logs never echo them.
 
 False positive? Put "privacy-gate: allow" on the line, with a reason.
@@ -362,7 +362,7 @@ def scan_commit(sha: str, terms: list[str], emails: set[str], check_author: bool
             in_header, path = True, None
         elif in_header and line.startswith("+++ "):
             target = line[4:]
-            path = None if target == "/dev/null" else target.removeprefix("b/")
+            path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
         elif line.startswith("@@"):
             in_header = False
             m = re.search(r"\+(\d+)", line)
