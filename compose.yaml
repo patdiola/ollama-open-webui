@@ -60,6 +60,24 @@ services:
       # default, it gives the model today's date and tells it to trust the
       # sources over its training data, which ends months before the model
       # is released. {{CURRENT_DATE}} and {{CONTEXT}} are filled per chat.
+      # Prompt that turns the chat into web search queries. Open WebUI's default
+      # asks for "broad" queries, so the model swaps names it doesn't know (a
+      # new product) for ones it does, and searches for the wrong thing.
+      QUERY_GENERATION_PROMPT_TEMPLATE: |
+        ### Task:
+        Write web search queries for the user's latest message, using the chat history for context. Generate 1-3 queries unless it is certain that no search is needed; then return an empty list. Today's date is {{CURRENT_DATE}}.
+
+        ### Guidelines:
+        - Keep names of products, projects, companies, people, versions and model numbers exactly as the user wrote them, including spelling and capitalisation.
+        - Never replace a name you don't recognise with one you do. Unfamiliar names are probably newer than your training data; search for them as written.
+        - Make the first query stay close to the user's own wording. Further queries may rephrase or add context, but must keep the same names.
+        - Prefer specific queries over broad ones. Add the year only when the user asks about recent or current information.
+        - Respond with a JSON object only, with no other text: { "queries": ["query1", "query2"] }. If no search is needed: { "queries": [] }.
+
+        ### Chat History:
+        <chat_history>
+        {{MESSAGES:END:6}}
+        </chat_history>
       RAG_TEMPLATE: |
         ### Task:
         Answer the user's query using the context below, which was retrieved for this query (web search results or the user's documents). Today's date is {{CURRENT_DATE}}.
