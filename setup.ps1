@@ -446,13 +446,13 @@ function Configure-Cloud {
 function Configure-Search {
   $cur = EnvGet "WEB_SEARCH_ENGINE"
   if ((EnvGet "ENABLE_WEB_SEARCH") -ne "true" -or -not $cur) { $cur = "off" }
-  Say "Web search lets models look things up online. Optional; the search"
-  Say "queries (not your whole chat) go to the provider you pick."
+  Say "Web search lets models look things up online; it's on by default. The"
+  Say "search queries, not your whole chat, go to the provider you pick."
   Say "  off         no web access (most private)"
   Say "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
   Say "  brave       needs a Brave Search API key; reliable, independent index"
   Say "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
-  Say "Not sure? Pick duckduckgo, or off."
+  Say "Not sure? Keep duckduckgo; pick off for no web access."
   do { $engine = Ask "Web search" $cur } until (@("off", "duckduckgo", "brave", "tavily") -contains $engine)
   $brave = EnvGet "BRAVE_SEARCH_API_KEY"
   $tavily = EnvGet "TAVILY_API_KEY"

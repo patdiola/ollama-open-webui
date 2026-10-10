@@ -466,13 +466,13 @@ configure_search() {
   local cur
   cur=$(env_get WEB_SEARCH_ENGINE)
   [ "$(env_get ENABLE_WEB_SEARCH)" = true ] || cur=off
-  info "Web search lets models look things up online. Optional; the search"
-  info "queries (not your whole chat) go to the provider you pick."
+  info "Web search lets models look things up online; it's on by default. The"
+  info "search queries, not your whole chat, go to the provider you pick."
   info "  off         no web access (most private)"
   info "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
   info "  brave       needs a Brave Search API key; reliable, independent index"
   info "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
-  info "Not sure? Pick duckduckgo, or off."
+  info "Not sure? Keep duckduckgo; pick off for no web access."
   while true; do
     ask "Web search" "${cur:-off}"
     case "$REPLY" in off|duckduckgo|brave|tavily) SEARCH=$REPLY; break ;; esac

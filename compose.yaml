@@ -49,9 +49,9 @@ services:
       ENABLE_OPENAI_API: ${ENABLE_OPENAI_API:-false}
       OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URLS:-}
       OPENAI_API_KEYS: ${OPENAI_API_KEYS:-}
-      # Optional web search. Off unless configured.
-      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
-      WEB_SEARCH_ENGINE: ${WEB_SEARCH_ENGINE:-}
+      # Web search, on by default (DuckDuckGo needs no key).
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-true}
+      WEB_SEARCH_ENGINE: ${WEB_SEARCH_ENGINE:-duckduckgo}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       WEB_SEARCH_RESULT_COUNT: ${WEB_SEARCH_RESULT_COUNT:-5}
