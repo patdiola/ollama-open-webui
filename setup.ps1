@@ -636,7 +636,9 @@ function Sync-OllamaEnv {
   Ok "Ollama settings saved to your Windows user environment variables"
   if (Ollama-Up) {
     Say "Restarting Ollama to apply them..."
-    Get-Process -Name "ollama app", "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Model runners too: left running, they keep holding GPU memory.
+    Get-Process -Name "ollama app", "ollama", "llama-server", "ollama_llama_server" -ErrorAction SilentlyContinue |
+      Stop-Process -Force -ErrorAction SilentlyContinue
     for ($i = 0; $i -lt 15 -and (Ollama-Up); $i++) { Start-Sleep -Seconds 1 }
     if (Ollama-Up) { Warn "Couldn't stop Ollama. Quit it from the system tray and start it again to apply them." }
   }

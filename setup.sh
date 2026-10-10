@@ -630,7 +630,7 @@ check_native_ollama() {
 # in .env removes them) and restart Ollama if one changed. Linux: the
 # settings belong in the ollama systemd service.
 sync_native_ollama_env() {
-  local k want="" changed="" i
+  local k want="" changed="" i p
   if [ -n "$(env_get OLLAMA_KV_CACHE_TYPE)" ] && [ "$(env_get OLLAMA_FLASH_ATTENTION)" != 1 ]; then
     warn "OLLAMA_KV_CACHE_TYPE only works with OLLAMA_FLASH_ATTENTION=1."
   fi
@@ -655,7 +655,8 @@ sync_native_ollama_env() {
   if ollama_up; then
     info "Restarting Ollama to apply them..."
     osascript -e 'quit app "Ollama"' >/dev/null 2>&1 || true
-    pkill -x ollama >/dev/null 2>&1 || true
+    # Model runners too: left running, they keep holding GPU memory.
+    for p in ollama llama-server ollama_llama_server; do pkill -x "$p" >/dev/null 2>&1 || true; done
     for i in $(seq 1 15); do ollama_up || break; sleep 1; done
     ollama_up && warn "Couldn't stop Ollama. Quit it from the menu bar and open it again to apply them."
   fi
