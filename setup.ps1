@@ -334,8 +334,22 @@ function Pick-Models([string]$current) {
   return ($out -join " ")
 }
 
+# Largest power-of-two context whose cache fits in $left GB. Calibrated on
+# qwen3:30b (about 8000 tokens per GB of f16 cache); models that need more
+# are caught by Check-GpuFit after setup.
+function Get-ContextSuggestion([double]$left, [string]$kv) {
+  $factor = 1.0
+  if ($kv -eq "q8_0") { $factor = 0.53 } elseif ($kv -eq "q4_0") { $factor = 0.28 }
+  $tokens = $left * 8000 / $factor
+  $ctx = 2048
+  while ($ctx * 2 -le $tokens -and $ctx -lt 131072) { $ctx *= 2 }
+  return $ctx
+}
+
 # Suggests GPU memory settings, leaving headroom for context and other apps.
-function Configure-Memory([string]$models) {
+# With web search on, it favours a 4-bit cache: search results fill the
+# context, so twice the context matters more than exact recall.
+function Configure-Memory([string]$models, [bool]$search) {
   $budget = (Get-MemoryBudget)[0]
   $largest = 0; $largestTag = ""
   $catalog = Get-Catalog
@@ -345,32 +359,40 @@ function Configure-Memory([string]$models) {
     }
   }
   $left = [math]::Round($budget * 0.9 - $largest, 1)
-  $suggest = 4096
-  if ($left -ge 2) { $suggest = 8192 }
-  if ($left -ge 6) { $suggest = 16384 }
   Say "Besides the model itself, Ollama needs memory for the conversation it"
   Say "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
   Say "part of the model runs on the CPU and replies get much slower."
   Say "  Memory for models: $budget GB, keeping 10% free for Windows and other apps"
   if ($largestTag) { Say "  Largest model:     $largestTag, about $largest GB" }
-  Say "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
-  Say "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
-  Say "show 100% GPU while a model is loaded."
+  Say "  Left for context:  about $left GB"
   $now = Get-OllamaInUse "OLLAMA_CONTEXT_LENGTH"
-  if ($now) { Say "  Ollama uses now:    $now tokens" }
+  if ($now) { Say "  Ollama uses now:   $now tokens" }
+  Say ""
+  Say "Flash attention shrinks the context memory and is usually faster. With"
+  Say "it on, the context can be stored at lower precision:"
+  Say "  q8_0  about half the memory, little quality loss"
+  Say "  q4_0  about a quarter; recalls details from long chats a bit less exactly"
+  if ($search) { Say "Recommended with web search: q4_0, so search results get twice the room." }
+  $faDef = "y"
+  if ((EnvGet "OLLAMA_FLASH_ATTENTION") -eq "0") { $faDef = "n" }
+  if (YesNo "Use flash attention?" $faDef) {
+    $fa = "1"
+    $kvDef = EnvGet "OLLAMA_KV_CACHE_TYPE"
+    if (-not $kvDef) { if ($search) { $kvDef = "q4_0" } else { $kvDef = "q8_0" } }
+    do { $kv = Ask "Context precision (q8_0 or q4_0)" $kvDef } until (@("q8_0", "q4_0") -contains $kv)
+  } else { $fa = "0"; $kv = "" }
+  $suggest = Get-ContextSuggestion $left $kv
+  Say ""
+  Say "About $suggest tokens of context fit in the room left. Lower is safer;"
+  Say "0 leaves it to Ollama. After setup, setup checks that the model fits."
+  if ($search) {
+    Say "Web search needs 16384 or more. With 65536 or more, it sends whole pages"
+    Say "(4 results) instead of excerpts, which gives better answers."
+  }
   $def = EnvGet "OLLAMA_CONTEXT_LENGTH"
   if (-not $def) { $def = "$suggest" }
   do { $ctx = Ask "Context length in tokens" $def } until ($ctx -match "^\d+$")
   if ($ctx -eq "0") { $ctx = "" }
-  Say ""
-  Say "Flash attention with an 8-bit context cache (q8_0) roughly halves the"
-  Say "context memory, with little quality loss. Recommended."
-  $faDef = "y"
-  if ((EnvGet "OLLAMA_FLASH_ATTENTION") -eq "0") { $faDef = "n" }
-  if (YesNo "Turn them on?" $faDef) {
-    $fa = "1"; $kv = EnvGet "OLLAMA_KV_CACHE_TYPE"
-    if (-not $kv) { $kv = "q8_0" }
-  } else { $fa = "0"; $kv = "" }
   return @($ctx, $fa, $kv)
 }
 
@@ -476,15 +498,12 @@ function Configure {
   Say ""
   $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
 
-  Step "3/7  GPU memory"
-  $memory = Configure-Memory $models
-
-  Step "4/7  Local port"
+  Step "3/7  Local port"
   Say "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
   Say "another app already uses it; then pick any free number like 3001 or 8080."
   do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
 
-  Step "5/7  Remote access (Tailscale)"
+  Step "4/7  Remote access (Tailscale)"
   Say "Tailscale lets your phone and laptop reach this machine from anywhere at"
   Say "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
   Say "Wi-Fi network or the internet. It's free for personal use: create an"
@@ -495,9 +514,16 @@ function Configure {
   $ts = "false"
   if (YesNo "Set up Tailscale remote access?" $tsDef) { $ts = "true" }
 
-  Step "6/7  Optional extras"
+  Step "5/7  Optional extras"
   $cloud = Configure-Cloud
   $search = Configure-Search
+
+  Step "6/7  GPU memory"
+  $searchOn = ($search[0] -ne "off")
+  $memory = Configure-Memory $models $searchOn
+  # Whole pages give better answers but need room: 4 pages plus the chat.
+  $bypass = "false"; $results = "5"
+  if ($searchOn -and $memory[0] -and [int]$memory[0] -ge 65536) { $bypass = "true"; $results = "4" }
 
   Step "7/7  Where settings live"
   Say "a) .env (recommended): your answers here, or edits to .env (by hand or by"
@@ -530,7 +556,9 @@ function Configure {
   Say "Local URL:     http://localhost:$port"
   Say "Tailscale:     $ts"
   Say "Cloud APIs:    $cloudText"
-  Say "Web search:    $($search[0])"
+  $searchText = $search[0]
+  if ($searchOn) { if ($bypass -eq "true") { $searchText = "$searchText, whole pages, $results results" } else { $searchText = "$searchText, excerpts, $results results" } }
+  Say "Web search:    $searchText"
   Say "Settings from: $settingsFrom"
   if (-not (YesNo "Save to .env?" "y")) { Fail "Nothing saved." }
 
@@ -565,6 +593,8 @@ function Configure {
   }
   EnvSet "BRAVE_SEARCH_API_KEY" $search[1]
   EnvSet "TAVILY_API_KEY" $search[2]
+  EnvSet "BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL" $bypass
+  EnvSet "WEB_SEARCH_RESULT_COUNT" $results
   EnvSet "ENABLE_PERSISTENT_CONFIG" $persist
   Ok "Saved .env"
 }
@@ -647,6 +677,31 @@ function Sync-OllamaEnv {
 function Invoke-Ollama([string[]]$argv) {
   if ((EnvGet "OLLAMA_MODE") -eq "container") { return (Run "docker" (@("exec", "ollama", "ollama") + $argv)) }
   return (Run (Ollama-Exe) $argv)
+}
+
+# Python run inside the Open WebUI container, which reaches Ollama in both
+# modes: loads a model, then prints its size, size in GPU memory and context.
+$FitPy = "import json,os,sys,urllib.request as u; b=os.environ['OLLAMA_BASE_URL']; m=sys.argv[1]; u.urlopen(u.Request(b+'/api/generate',json.dumps({'model':m,'prompt':''}).encode()),timeout=600).read(); [print(x['size'],x['size_vram'],x.get('context_length',0)) for x in json.load(u.urlopen(b+'/api/ps',timeout=10))['models'] if x['name'] in (m,m+':latest')]"
+
+# Loads the largest selected model and warns if part of it runs on the CPU.
+function Check-GpuFit {
+  $models = @((EnvGet "OLLAMA_PULL_MODELS") -split "\s+" | Where-Object { $_ })
+  if ($models.Count -eq 0) { return }
+  $pick = $models[0]; $size = 0
+  foreach ($c in Get-Catalog) {
+    if ($models -contains $c[0] -and $c[1] -gt $size) { $pick = $c[0]; $size = $c[1] }
+  }
+  Say "Loading $pick to check it fits in GPU memory..."
+  $ErrorActionPreference = "Continue"
+  $out = & docker exec open-webui python3 -c $FitPy $pick 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $out) { Warn "Couldn't load $pick to check its fit."; return }
+  $f = "$out".Trim() -split "\s+"
+  $total = [double]$f[0]; $vram = [double]$f[1]
+  if ($vram -eq 0) { return }
+  $gb = [math]::Round($total / 1e9, 1)
+  if ($vram -ge $total) { Ok "$pick fits in GPU memory ($gb GB with $($f[2]) tokens of context)"; return }
+  Warn "$pick doesn't fit: $([math]::Round(($total - $vram) / 1e9, 1)) of $gb GB runs on the CPU, so replies are slow."
+  Say "Lower the context length, use the q4_0 cache, or pick a smaller model: setup.cmd configure"
 }
 
 function Pull-Models {
@@ -762,6 +817,7 @@ function Apply {
 
   Step "Models"
   Pull-Models
+  Check-GpuFit
 
   First-Admin $port
 

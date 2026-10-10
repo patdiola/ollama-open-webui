@@ -353,9 +353,23 @@ pick_models() {
   MODELS=$(echo $out)
 }
 
+# Largest power-of-two context whose cache fits in $1 GB with cache type $2.
+# Calibrated on qwen3:30b (about 8000 tokens per GB of f16 cache); models
+# that need more are caught by check_gpu_fit after setup.
+context_suggestion() {
+  awk -v l="$1" -v kv="$2" 'BEGIN {
+    f = (kv == "q8_0") ? 0.53 : (kv == "q4_0") ? 0.28 : 1
+    t = l * 8000 / f; c = 2048
+    while (c * 2 <= t && c < 131072) c *= 2
+    print c
+  }'
+}
+
 # Suggests GPU memory settings, leaving headroom for context and other apps.
+# With web search on ($1 = true), it favours a 4-bit cache: search results
+# fill the context, so twice the context matters more than exact recall.
 configure_memory() {
-  local mem budget m size largest=0 largest_tag="" left suggest def d
+  local search=$1 mem budget m size largest=0 largest_tag="" left suggest def d
   mem=$(detect_memory); budget=${mem%%|*}
   for m in $MODELS; do
     size=$(grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$m" '$1 == t { print $2 }')
@@ -363,31 +377,46 @@ configure_memory() {
     if awk -v a="$size" -v b="$largest" 'BEGIN { exit !(a > b) }'; then largest=$size; largest_tag=$m; fi
   done
   left=$(awk -v b="$budget" -v l="$largest" 'BEGIN { printf "%.1f", b * 0.9 - l }')
-  suggest=$(awk -v x="$left" 'BEGIN { print (x >= 6) ? 16384 : (x >= 2) ? 8192 : 4096 }')
   info "Besides the model itself, Ollama needs memory for the conversation it"
   info "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
   info "part of the model runs on the CPU and replies get much slower."
   info "  Memory for models: $budget GB, keeping 10% free for the desktop and other apps"
   [ -n "$largest_tag" ] && info "  Largest model:     $largest_tag, about $largest GB"
-  info "  Left for context:  about $left GB, so about $suggest tokens is a safe start"
-  info "Lower is safer; 0 leaves it to Ollama. After setup, 'ollama ps' should"
-  info "show 100% GPU while a model is loaded."
+  info "  Left for context:  about $left GB"
   d=$(ollama_in_use OLLAMA_CONTEXT_LENGTH) && [ -n "$d" ] && info "  Ollama uses now:   $d tokens"
+  info ""
+  info "Flash attention shrinks the context memory and is usually faster. With"
+  info "it on, the context can be stored at lower precision:"
+  info "  q8_0  about half the memory, little quality loss"
+  info "  q4_0  about a quarter; recalls details from long chats a bit less exactly"
+  [ "$search" = true ] && info "Recommended with web search: q4_0, so search results get twice the room."
+  def=y; [ "$(env_get OLLAMA_FLASH_ATTENTION)" = 0 ] && def=n
+  if yesno "Use flash attention?" "$def"; then
+    FA=1
+    def=$(env_get OLLAMA_KV_CACHE_TYPE)
+    [ -n "$def" ] || { [ "$search" = true ] && def=q4_0 || def=q8_0; }
+    while true; do
+      ask "Context precision (q8_0 or q4_0)" "$def"
+      case "$REPLY" in q8_0|q4_0) KV=$REPLY; break ;; esac
+    done
+  else
+    FA=0; KV=""
+  fi
+  suggest=$(context_suggestion "$left" "$KV")
+  info ""
+  info "About $suggest tokens of context fit in the room left. Lower is safer;"
+  info "0 leaves it to Ollama. After setup, setup checks that the model fits."
+  if [ "$search" = true ]; then
+    info "Web search needs 16384 or more. With 65536 or more, it sends whole pages"
+    info "(4 results) instead of excerpts, which gives better answers."
+  fi
   def=$(env_get OLLAMA_CONTEXT_LENGTH); [ -n "$def" ] || def=$suggest
   while true; do
     ask "Context length in tokens" "$def"
     case "$REPLY" in ''|*[!0-9]*) ;; *) CTX=$REPLY; break ;; esac
   done
   [ "$CTX" = 0 ] && CTX=""
-  info ""
-  info "Flash attention with an 8-bit context cache (q8_0) roughly halves the"
-  info "context memory, with little quality loss. Recommended."
-  def=y; [ "$(env_get OLLAMA_FLASH_ATTENTION)" = 0 ] && def=n
-  if yesno "Turn them on?" "$def"; then
-    FA=1; KV=$(env_get OLLAMA_KV_CACHE_TYPE); [ -n "$KV" ] || KV=q8_0
-  else
-    FA=0; KV=""
-  fi
+  return 0
 }
 
 configure_cloud() {
@@ -494,10 +523,7 @@ configure() {
   info ""
   pick_models "$(env_get OLLAMA_PULL_MODELS)"
 
-  step "3/7  GPU memory"
-  configure_memory
-
-  step "4/7  Local port"
+  step "3/7  Local port"
   info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
   info "another app already uses it; then pick any free number like 3001 or 8080."
   while true; do
@@ -505,7 +531,7 @@ configure() {
     case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
   done
 
-  step "5/7  Remote access (Tailscale)"
+  step "4/7  Remote access (Tailscale)"
   info "Tailscale lets your phone and laptop reach this machine from anywhere at"
   info "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
   info "Wi-Fi network or the internet. It's free for personal use: create an"
@@ -514,9 +540,15 @@ configure() {
   if yesno "Set up Tailscale remote access?" "$( [ "$(env_get TAILSCALE_SERVE)" = false ] && echo n || echo y)"; then
     TS=true; else TS=false; fi
 
-  step "6/7  Optional extras"
+  step "5/7  Optional extras"
   configure_cloud
   configure_search
+
+  step "6/7  GPU memory"
+  configure_memory "$( [ "$SEARCH" = off ] && echo false || echo true)"
+  # Whole pages give better answers but need room: 4 pages plus the chat.
+  BYPASS=false; RESULTS=5
+  if [ "$SEARCH" != off ] && [ "${CTX:-0}" -ge 65536 ]; then BYPASS=true; RESULTS=4; fi
 
   step "7/7  Where settings live"
   info "a) .env (recommended): your answers here, or edits to .env (by hand or by"
@@ -540,7 +572,7 @@ configure() {
   info "Local URL:     http://localhost:$PORT"
   info "Tailscale:     $TS"
   info "Cloud APIs:    ${CLOUD_URLS:-(none)}"
-  info "Web search:    $SEARCH"
+  info "Web search:    $SEARCH$( [ "$SEARCH" = off ] || { [ "$BYPASS" = true ] && echo ", whole pages, $RESULTS results" || echo ", excerpts, $RESULTS results"; })"
   info "Settings from: $( [ "$PERSIST" = false ] && echo .env || echo 'Admin Panel')"
   yesno "Save to .env?" y || die "Nothing saved."
 
@@ -575,6 +607,8 @@ configure() {
   fi
   env_set BRAVE_SEARCH_API_KEY "$BRAVE_KEY"
   env_set TAVILY_API_KEY "$TAVILY_KEY"
+  env_set BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL "$BYPASS"
+  env_set WEB_SEARCH_RESULT_COUNT "$RESULTS"
   env_set ENABLE_PERSISTENT_CONFIG "$PERSIST"
   ok "Saved .env"
 }
@@ -674,6 +708,33 @@ check_gpu_runtime() {
 run_ollama() {  # run_ollama ARGS...  (native or in the container)
   if [ "$(env_get OLLAMA_MODE)" = container ]; then docker exec ollama ollama "$@"
   else ollama "$@"; fi
+}
+
+# Python run inside the Open WebUI container, which reaches Ollama in both
+# modes: loads a model, then prints its size, size in GPU memory and context.
+FIT_PY="import json,os,sys,urllib.request as u; b=os.environ['OLLAMA_BASE_URL']; m=sys.argv[1]; u.urlopen(u.Request(b+'/api/generate',json.dumps({'model':m,'prompt':''}).encode()),timeout=600).read(); [print(x['size'],x['size_vram'],x.get('context_length',0)) for x in json.load(u.urlopen(b+'/api/ps',timeout=10))['models'] if x['name'] in (m,m+':latest')]"
+
+# Loads the largest selected model and warns if part of it runs on the CPU.
+check_gpu_fit() {
+  local models m size best=0 pick="" out total vram ctx
+  models=$(env_get OLLAMA_PULL_MODELS)
+  [ -n "$models" ] || return 0
+  for m in $models; do
+    [ -n "$pick" ] || pick=$m
+    size=$(grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$m" '$1 == t { print $2 }')
+    if [ -n "$size" ] && awk -v a="$size" -v b="$best" 'BEGIN { exit !(a > b) }'; then best=$size; pick=$m; fi
+  done
+  info "Loading $pick to check it fits in GPU memory..."
+  out=$(docker exec open-webui python3 -c "$FIT_PY" "$pick" 2>/dev/null) && [ -n "$out" ] \
+    || { warn "Couldn't load $pick to check its fit."; return 0; }
+  set -- $out; total=$1; vram=$2; ctx=$3
+  [ "$vram" -gt 0 ] || return 0
+  if [ "$vram" -ge "$total" ]; then
+    ok "$pick fits in GPU memory ($(awk -v t="$total" 'BEGIN { printf "%.1f", t / 1e9 }') GB with $ctx tokens of context)"
+  else
+    warn "$pick doesn't fit: $(awk -v t="$total" -v v="$vram" 'BEGIN { printf "%.1f of %.1f", (t - v) / 1e9, t / 1e9 }') GB runs on the CPU, so replies are slow."
+    info "Lower the context length, use the q4_0 cache, or pick a smaller model: ./setup.sh configure"
+  fi
 }
 
 pull_models() {
@@ -804,6 +865,7 @@ apply() {
 
   step "Models"
   pull_models
+  check_gpu_fit
 
   first_admin "$port"
 
