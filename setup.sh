@@ -99,7 +99,7 @@ gen_secret() {
 # there (e.g. ~/git/...) is cloned to the same path under the Windows user
 # folder, along with the personal gitignored files, and setup continues there.
 wsl_move_to_windows() {
-  local win_home rel dest f
+  local win_home rel dest f before
   win_home=$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("UserProfile")' 2>/dev/null | tr -d '\r')
   [ -n "$win_home" ] || die "Can't find your Windows user folder. Clone this repo under /mnt/c/, then run ./setup.sh from there."
   win_home=$(wslpath -u "$win_home")
@@ -111,12 +111,24 @@ wsl_move_to_windows() {
 
   bold "WSL detected, but this repo is inside WSL's own filesystem."
   info "The Windows setup needs it in a Windows folder."
+  if have git && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    warn "Uncommitted changes here won't be copied; commit them first to include them."
+  fi
   if [ -f "$dest/setup.sh" ]; then
     info "Using the existing copy at $(wslpath -w "$dest")"
+    # Bring it up to date with this copy's commits. Fast-forward only, so
+    # nothing there is overwritten; its .env (your saved answers) is kept.
+    if have git && [ -d "$dest/.git" ]; then
+      before=$(git -C "$dest" rev-parse HEAD 2>/dev/null || true)
+      if git -C "$dest" pull -q --ff-only "$PWD" HEAD >/dev/null 2>&1; then
+        [ "$(git -C "$dest" rev-parse HEAD)" = "$before" ] || ok "Updated it with the commits from this copy"
+      else
+        warn "Couldn't update it from this copy (it has changes of its own). Continuing with it as is."
+      fi
+    fi
   else
     [ -e "$dest" ] && die "$(wslpath -w "$dest") already exists. Move it aside, or clone this repo under /mnt/c/ yourself."
     have git || die "git is not installed. Clone this repo under /mnt/c/, then run ./setup.sh from there."
-    [ -z "$(git status --porcelain 2>/dev/null)" ] || warn "Uncommitted changes here won't be copied."
     yesno "Clone it to $(wslpath -w "$dest") and continue there?" y \
       || die "Clone this repo under /mnt/c/, then run ./setup.sh from there."
     mkdir -p "$(dirname "$dest")"
