@@ -718,6 +718,18 @@ function Setup-Tailscale([string]$port) {
   Ok "Remote access: $script:TsUrl (your tailnet only)"
 }
 
+# Search results go into the model's context. Too small a context and Ollama
+# drops them, so the model answers from its outdated training data.
+function Check-SearchContext {
+  if ((EnvGet "ENABLE_WEB_SEARCH") -ne "true") { return }
+  $raw = EnvGet "OLLAMA_CONTEXT_LENGTH"
+  $ctx = 0
+  if ($raw -match '^[0-9]+$') { $ctx = [int64]$raw }
+  if ($ctx -ge 16384) { return }
+  Warn "Web search works poorly with less than 16384 tokens of context (.env has '$raw');"
+  Warn "search results get cut off. Raise OLLAMA_CONTEXT_LENGTH if the model fits: setup.cmd configure"
+}
+
 function Apply {
   if (-not (Test-Path -LiteralPath $EnvFile)) { Configure }
   $mode = EnvGet "OLLAMA_MODE"
@@ -728,6 +740,7 @@ function Apply {
   Step "Checking prerequisites"
   Check-Docker
   if ($mode -eq "native") { Sync-OllamaEnv; Check-NativeOllama; Check-OllamaSettings }
+  Check-SearchContext
 
   Step "Starting containers"
   # Remove an Ollama container from a previously chosen profile.

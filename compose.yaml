@@ -54,6 +54,28 @@ services:
       WEB_SEARCH_ENGINE: ${WEB_SEARCH_ENGINE:-}
       BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      WEB_SEARCH_RESULT_COUNT: ${WEB_SEARCH_RESULT_COUNT:-5}
+      BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: ${BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:-false}
+      # Prompt wrapped around search results and documents. Unlike Open WebUI's
+      # default, it gives the model today's date and tells it to trust the
+      # sources over its training data, which ends months before the model
+      # is released. {{CURRENT_DATE}} and {{CONTEXT}} are filled per chat.
+      RAG_TEMPLATE: |
+        ### Task:
+        Answer the user's query using the context below, which was retrieved for this query (web search results or the user's documents). Today's date is {{CURRENT_DATE}}.
+
+        ### Guidelines:
+        - Your training data ends well before today. The context is newer than your training, so prefer it over what you remember.
+        - If the context mentions something you have never heard of (a new product, release, version or event), treat it as real and recent. Don't tell the user they are mistaken because you don't recognise it.
+        - If the context and your own knowledge disagree, say so and go with the context, unless it is clearly unreliable.
+        - If the context doesn't contain the answer, say that plainly, then answer from your own knowledge and say it may be out of date.
+        - Never invent facts, names, numbers, links or quotes.
+        - Cite sources inline as [id] (e.g. [1]) only when the <source> tag has an id attribute. Don't use XML tags in your answer.
+        - Respond in the same language as the user's query.
+
+        <context>
+        {{CONTEXT}}
+        </context>
     volumes:
       - open-webui-data:/app/backend/data
 
