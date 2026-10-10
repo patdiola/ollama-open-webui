@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 ENV_FILE=.env
 OLLAMA_SERVICES="ollama-cpu ollama-nvidia ollama-amd"
-OLLAMA_TUNING="OLLAMA_MODELS OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE"
+OLLAMA_TUNING="OLLAMA_MODELS OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE OLLAMA_KEEP_ALIVE"
 
 # ------------------------------------------------------------------ helpers
 
@@ -342,6 +342,7 @@ pick_models() {
   info "models later with './setup.sh configure'. Browse more at ollama.com/library."
   info ""
   info "Enter numbers and/or any Ollama tags, separated by spaces (e.g. 2 5)."
+  info "The first one becomes the default chat model."
   ask "Models to download" "$current"
   for choice in $REPLY; do
     case "$choice" in
@@ -465,6 +466,7 @@ configure_cloud() {
 configure_search() {
   local cur
   cur=$(env_get WEB_SEARCH_ENGINE)
+  [ "$cur" = external ] && cur=auto
   [ "$(env_get ENABLE_WEB_SEARCH)" = true ] || cur=off
   info "Web search lets models look things up online; it's on by default. The"
   info "search queries, not your whole chat, go to the provider you pick."
@@ -472,22 +474,38 @@ configure_search() {
   info "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
   info "  brave       needs a Brave Search API key; reliable, independent index"
   info "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
+  info "  serpapi     needs a SerpAPI key; Google results, short snippets"
+  info "  auto        Tavily, then SerpAPI, then DuckDuckGo, switching automatically"
+  info "              when one fails or runs out of credits (add the keys you have)"
   info "Not sure? Keep duckduckgo; pick off for no web access."
   while true; do
     ask "Web search" "${cur:-off}"
-    case "$REPLY" in off|duckduckgo|brave|tavily) SEARCH=$REPLY; break ;; esac
+    case "$REPLY" in off|duckduckgo|brave|tavily|serpapi|auto) SEARCH=$REPLY; break ;; esac
   done
-  BRAVE_KEY=$(env_get BRAVE_SEARCH_API_KEY); TAVILY_KEY=$(env_get TAVILY_API_KEY)
+  BRAVE_KEY=$(env_get BRAVE_SEARCH_API_KEY); TAVILY_KEY=$(env_get TAVILY_API_KEY); SERPAPI_KEY=$(env_get SERPAPI_API_KEY)
   if [ "$SEARCH" = brave ] && { [ -z "$BRAVE_KEY" ] || ! yesno "Keep the saved Brave key?" y; }; then
     info "Get a key: sign up at https://api-dashboard.search.brave.com, choose a"
     info "plan (see brave.com/search/api for current pricing), then open"
     info "'API Keys' and copy the key."
     ask_secret "Paste the Brave Search API key (hidden)"; BRAVE_KEY=$REPLY
   fi
+  if [ "$SEARCH" = auto ]; then
+    info "Add the keys you have; press Enter to skip one. Without any key, auto"
+    info "uses DuckDuckGo."
+    [ -n "$TAVILY_KEY" ] && yesno "Keep the saved Tavily key?" y \
+      || { ask_secret "Tavily API key (hidden, Enter to skip)"; TAVILY_KEY=$REPLY; }
+    [ -n "$SERPAPI_KEY" ] && yesno "Keep the saved SerpAPI key?" y \
+      || { ask_secret "SerpAPI key (hidden, Enter to skip)"; SERPAPI_KEY=$REPLY; }
+  fi
   if [ "$SEARCH" = tavily ] && { [ -z "$TAVILY_KEY" ] || ! yesno "Keep the saved Tavily key?" y; }; then
     info "Get a key: sign up at https://app.tavily.com; your key (starts with"
     info "tvly-) is on the overview page. Check their site for current free limits."
     ask_secret "Paste the Tavily API key (hidden)"; TAVILY_KEY=$REPLY
+  fi
+  if [ "$SEARCH" = serpapi ] && { [ -z "$SERPAPI_KEY" ] || ! yesno "Keep the saved SerpAPI key?" y; }; then
+    info "Get a key: sign up at https://serpapi.com, then copy the whole key from"
+    info "https://serpapi.com/manage-api-key. Check their site for current free limits."
+    ask_secret "Paste the SerpAPI key (hidden)"; SERPAPI_KEY=$REPLY
   fi
 }
 
@@ -591,6 +609,7 @@ configure() {
     env_set OLLAMA_BASE_URL "http://host.docker.internal:11434"
   fi
   env_set OLLAMA_PULL_MODELS "$MODELS"
+  env_set DEFAULT_MODELS "${MODELS%% *}"
   env_set OLLAMA_MODELS "$MODELS_DIR"
   env_set OLLAMA_CONTEXT_LENGTH "$CTX"
   env_set OLLAMA_FLASH_ATTENTION "$FA"
@@ -603,10 +622,11 @@ configure() {
   if [ "$SEARCH" = off ]; then
     env_set ENABLE_WEB_SEARCH false; env_set WEB_SEARCH_ENGINE ""
   else
-    env_set ENABLE_WEB_SEARCH true; env_set WEB_SEARCH_ENGINE "$SEARCH"
+    env_set ENABLE_WEB_SEARCH true; env_set WEB_SEARCH_ENGINE "$( [ "$SEARCH" = auto ] && echo external || echo "$SEARCH")"
   fi
   env_set BRAVE_SEARCH_API_KEY "$BRAVE_KEY"
   env_set TAVILY_API_KEY "$TAVILY_KEY"
+  env_set SERPAPI_API_KEY "$SERPAPI_KEY"
   env_set BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL "$BYPASS"
   env_set WEB_SEARCH_RESULT_COUNT "$RESULTS"
   env_set ENABLE_PERSISTENT_CONFIG "$PERSIST"

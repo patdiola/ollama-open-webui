@@ -16,7 +16,7 @@ Set-Location -LiteralPath $PSScriptRoot
 $EnvFile = Join-Path $PSScriptRoot ".env"
 $ExampleFile = Join-Path $PSScriptRoot ".env.example"
 $OllamaServices = @("ollama-cpu", "ollama-nvidia", "ollama-amd")
-$OllamaTuning = @("OLLAMA_MODELS", "OLLAMA_CONTEXT_LENGTH", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE")
+$OllamaTuning = @("OLLAMA_MODELS", "OLLAMA_CONTEXT_LENGTH", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE", "OLLAMA_KEEP_ALIVE")
 $script:TsUrl = ""
 
 # ------------------------------------------------------------------ helpers
@@ -322,6 +322,7 @@ function Pick-Models([string]$current) {
   Say "models later with 'setup.cmd configure'. Browse more at ollama.com/library."
   Say ""
   Say "Enter numbers and/or any Ollama tags, separated by spaces (e.g. 2 5)."
+  Say "The first one becomes the default chat model."
   $answer = Ask "Models to download" $current
   $out = @()
   foreach ($c in ($answer -split "\s+" | Where-Object { $_ })) {
@@ -445,6 +446,7 @@ function Configure-Cloud {
 
 function Configure-Search {
   $cur = EnvGet "WEB_SEARCH_ENGINE"
+  if ($cur -eq "external") { $cur = "auto" }
   if ((EnvGet "ENABLE_WEB_SEARCH") -ne "true" -or -not $cur) { $cur = "off" }
   Say "Web search lets models look things up online; it's on by default. The"
   Say "search queries, not your whole chat, go to the provider you pick."
@@ -452,22 +454,37 @@ function Configure-Search {
   Say "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
   Say "  brave       needs a Brave Search API key; reliable, independent index"
   Say "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
+  Say "  serpapi     needs a SerpAPI key; Google results, short snippets"
+  Say "  auto        Tavily, then SerpAPI, then DuckDuckGo, switching automatically"
+  Say "              when one fails or runs out of credits (add the keys you have)"
   Say "Not sure? Keep duckduckgo; pick off for no web access."
-  do { $engine = Ask "Web search" $cur } until (@("off", "duckduckgo", "brave", "tavily") -contains $engine)
+  do { $engine = Ask "Web search" $cur } until (@("off", "duckduckgo", "brave", "tavily", "serpapi", "auto") -contains $engine)
   $brave = EnvGet "BRAVE_SEARCH_API_KEY"
   $tavily = EnvGet "TAVILY_API_KEY"
+  $serpapi = EnvGet "SERPAPI_API_KEY"
   if ($engine -eq "brave" -and (-not $brave -or -not (YesNo "Keep the saved Brave key?" "y"))) {
     Say "Get a key: sign up at https://api-dashboard.search.brave.com, choose a"
     Say "plan (see brave.com/search/api for current pricing), then open"
     Say "'API Keys' and copy the key."
     $brave = Ask-Secret "Paste the Brave Search API key (hidden)"
   }
+  if ($engine -eq "auto") {
+    Say "Add the keys you have; press Enter to skip one. Without any key, auto"
+    Say "uses DuckDuckGo."
+    if (-not $tavily -or -not (YesNo "Keep the saved Tavily key?" "y")) { $tavily = Ask-Secret "Tavily API key (hidden, Enter to skip)" }
+    if (-not $serpapi -or -not (YesNo "Keep the saved SerpAPI key?" "y")) { $serpapi = Ask-Secret "SerpAPI key (hidden, Enter to skip)" }
+  }
   if ($engine -eq "tavily" -and (-not $tavily -or -not (YesNo "Keep the saved Tavily key?" "y"))) {
     Say "Get a key: sign up at https://app.tavily.com; your key (starts with"
     Say "tvly-) is on the overview page. Check their site for current free limits."
     $tavily = Ask-Secret "Paste the Tavily API key (hidden)"
   }
-  return @($engine, $brave, $tavily)
+  if ($engine -eq "serpapi" -and (-not $serpapi -or -not (YesNo "Keep the saved SerpAPI key?" "y"))) {
+    Say "Get a key: sign up at https://serpapi.com, then copy the whole key from"
+    Say "https://serpapi.com/manage-api-key. Check their site for current free limits."
+    $serpapi = Ask-Secret "Paste the SerpAPI key (hidden)"
+  }
+  return @($engine, $brave, $tavily, $serpapi)
 }
 
 function Configure {
@@ -577,6 +594,7 @@ function Configure {
     EnvSet "OLLAMA_BASE_URL" "http://host.docker.internal:11434"
   }
   EnvSet "OLLAMA_PULL_MODELS" $models
+  EnvSet "DEFAULT_MODELS" (($models -split "\s+") | Where-Object { $_ } | Select-Object -First 1)
   EnvSet "OLLAMA_MODELS" $modelsDir
   EnvSet "OLLAMA_CONTEXT_LENGTH" $memory[0]
   EnvSet "OLLAMA_FLASH_ATTENTION" $memory[1]
@@ -589,10 +607,12 @@ function Configure {
   if ($search[0] -eq "off") {
     EnvSet "ENABLE_WEB_SEARCH" "false"; EnvSet "WEB_SEARCH_ENGINE" ""
   } else {
-    EnvSet "ENABLE_WEB_SEARCH" "true"; EnvSet "WEB_SEARCH_ENGINE" $search[0]
+    $engineValue = $search[0]; if ($engineValue -eq "auto") { $engineValue = "external" }
+    EnvSet "ENABLE_WEB_SEARCH" "true"; EnvSet "WEB_SEARCH_ENGINE" $engineValue
   }
   EnvSet "BRAVE_SEARCH_API_KEY" $search[1]
   EnvSet "TAVILY_API_KEY" $search[2]
+  EnvSet "SERPAPI_API_KEY" $search[3]
   EnvSet "BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL" $bypass
   EnvSet "WEB_SEARCH_RESULT_COUNT" $results
   EnvSet "ENABLE_PERSISTENT_CONFIG" $persist

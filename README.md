@@ -64,7 +64,7 @@ Notes:
 | Port | 3000 | always bound to `127.0.0.1` |
 | Tailscale remote access | on | tailnet only; never Funnel |
 | Cloud models | off | OpenAI, OpenRouter, or any OpenAI-compatible API. Chats sent to them leave your machine |
-| Web search | on, DuckDuckGo | Brave or Tavily for better results; `off` for no web access. To start every chat with it: Admin Panel → Settings → Models → Default Features |
+| Web search | on, DuckDuckGo | Tavily (recommended), Brave or SerpAPI for better results; `off` for no web access. To start every chat with it: Admin Panel → Settings → Models → Default Features |
 | Settings source | `.env` | `.env` re-applied on every start; or let the Admin Panel own them |
 
 Everything lands in `.env`, which is gitignored and created with owner-only permissions on macOS/Linux. See [`.env.example`](.env.example) for every option.
