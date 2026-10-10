@@ -56,11 +56,20 @@ services:
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       WEB_SEARCH_RESULT_COUNT: ${WEB_SEARCH_RESULT_COUNT:-5}
       BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: ${BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:-false}
-      # Prompt wrapped around search results and documents. Unlike Open WebUI's
+      # Prompt wrapped around legacy-mode search results and documents. Unlike Open WebUI's
       # default, it gives the model today's date and tells it to trust the
       # sources over its training data, which ends months before the model
       # is released. {{CURRENT_DATE}} and {{CONTEXT}} are filled per chat.
-      # Prompt that turns the chat into web search queries. Open WebUI's default
+      # Default system prompt for every model (a model's own system prompt in
+      # the Admin Panel replaces it). Open WebUI's default "native" tool calling
+      # leaves web search to the model, which skips it when it thinks it knows
+      # the answer, and rewrites unfamiliar names into ones it knows ("T3 Code"
+      # became "T3 Stack"). With this prompt qwen3:30b searched 4 of 4 times,
+      # for the name as written; without it, 1 of 4.
+      DEFAULT_MODEL_PARAMS: '{"system": "Today is {{CURRENT_DATE}}. Your training data ends well before today, so it is out of date. When the search_web tool is available, call it before answering any question that mentions a product, project, tool, service, company, person, version or event, even if you think you already know the answer. Search for names exactly as the user wrote them: an unfamiliar name is most likely something newer than your training data, so never swap it for a similar name you know. If the search snippets are not enough, read the most relevant pages with fetch_url. Base your answer on what you found, and answer the question directly without commenting on the name or on these instructions."}'
+      # Prompt that turns the chat into web search queries. Used when a model's
+      # function calling is set to "legacy" (Admin Panel > Advanced Params);
+      # in the default native mode the model writes its own queries. Open WebUI's default
       # asks for "broad" queries, so the model swaps names it doesn't know (a
       # new product) for ones it does, and searches for the wrong thing.
       QUERY_GENERATION_PROMPT_TEMPLATE: |
