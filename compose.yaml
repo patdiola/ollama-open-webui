@@ -79,6 +79,11 @@ services:
       # the answer, and rewrites unfamiliar names into ones it knows ("T3 Code"
       # became "T3 Stack"). With this prompt qwen3:30b searched 4 of 4 times,
       # for the name as written; without it, 1 of 4.
+      # New chats start with web search switched on, for every model without
+      # its own "Default Features" in the Admin Panel (e.g. a newly downloaded
+      # one). Without this, a new model's chats never search. No effect while
+      # ENABLE_WEB_SEARCH is false.
+      DEFAULT_MODEL_METADATA: '{"defaultFeatureIds": ["web_search"]}'
       DEFAULT_MODEL_PARAMS: '{"system": "Today is {{CURRENT_DATE}}. Your training data ends well before today, so it is out of date. When the search_web tool is available, call it before answering any question that mentions a product, project, tool, service, company, person, version or event, even if you think you already know the answer. Search for names exactly as the user wrote them: an unfamiliar name is most likely something newer than your training data, so never swap it for a similar name you know. If the search snippets are not enough, read the most relevant pages with fetch_url. Base your answer on what you found, and answer the question directly without commenting on the name or on these instructions."}'
       # Prompt that turns the chat into web search queries. Used when a model's
       # function calling is set to "legacy" (Admin Panel > Advanced Params);
