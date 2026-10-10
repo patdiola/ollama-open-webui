@@ -49,6 +49,13 @@ services:
       # API keys (Settings > Account > API Keys) for scripts and tools. Off by
       # default: a key acts as the account that created it.
       ENABLE_API_KEYS: ${ENABLE_API_KEYS:-false}
+      # Memory: after each chat turn the model reviews it and saves lasting
+      # facts about the user (where they live, projects, preferences) to that
+      # user's account; saved memories are added to every new chat. Stored only
+      # in this PC's database. Users see and edit theirs in Settings >
+      # Personalization > Memory.
+      ENABLE_MEMORY_BACKGROUND_REVIEW: ${ENABLE_MEMORY_BACKGROUND_REVIEW:-true}
+      MEMORIES_REVIEW_INTERVAL_TURNS: ${MEMORIES_REVIEW_INTERVAL_TURNS:-1}
       # Model new chats start with (setup sets the first model you pick).
       DEFAULT_MODELS: ${DEFAULT_MODELS:-}
       # Titles run on the chat model unless TASK_MODEL names another. Tags and
@@ -72,23 +79,28 @@ services:
       EXTERNAL_WEB_SEARCH_URL: ${EXTERNAL_WEB_SEARCH_URL:-http://search-fallback:8000/search}
       WEB_SEARCH_RESULT_COUNT: ${WEB_SEARCH_RESULT_COUNT:-5}
       BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: ${BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:-false}
-      # Prompt wrapped around legacy-mode search results and documents. Unlike Open WebUI's
-      # default, it gives the model today's date and tells it to trust the
-      # sources over its training data, which ends months before the model
-      # is released. {{CURRENT_DATE}} and {{CONTEXT}} are filled per chat.
+      # Defaults for every model without its own settings in the Admin Panel
+      # (e.g. a newly downloaded one):
+      # - web search available and on in new chats. The web app only applies
+      #   the default when the model lists its capabilities, so this gives
+      #   them Open WebUI's standard set, the same the Admin Panel saves.
+      # - tools for knowledge bases, notes, memory, channels, automations,
+      #   calendar, tasks, past chats, sub-agents and asking the user off.
+      #   With them on, 30B models searched notes and knowledge bases, or
+      #   stopped to ask a question, instead of searching the web. Saved
+      #   memories still reach every chat (see Memory above).
+      # No effect on web search while ENABLE_WEB_SEARCH is false.
+      DEFAULT_MODEL_METADATA: '{"capabilities": {"file_context": true, "vision": true, "file_upload": true, "web_search": true, "image_generation": true, "code_interpreter": true, "terminal": true, "citations": true, "status_updates": true, "memory": true, "builtin_tools": true}, "defaultFeatureIds": ["web_search"], "builtinTools": {"knowledge": false, "notes": false, "memory": false, "channels": false, "automations": false, "calendar": false, "tasks": false, "chats": false, "subagents": false, "user_input": false}}'
       # Default system prompt for every model (a model's own system prompt in
-      # the Admin Panel replaces it). Open WebUI's default "native" tool calling
-      # leaves web search to the model, which skips it when it thinks it knows
-      # the answer, and rewrites unfamiliar names into ones it knows ("T3 Code"
-      # became "T3 Stack"). With this prompt qwen3:30b searched 4 of 4 times,
-      # for the name as written; without it, 1 of 4.
-      # New chats start with web search switched on, for every model without
-      # its own settings in the Admin Panel (e.g. a newly downloaded one).
-      # The web app only applies the default when the model lists its
-      # capabilities, so this also gives them Open WebUI's standard set (the
-      # same the Admin Panel saves). No effect while ENABLE_WEB_SEARCH is false.
-      DEFAULT_MODEL_METADATA: '{"capabilities": {"file_context": true, "vision": true, "file_upload": true, "web_search": true, "image_generation": true, "code_interpreter": true, "terminal": true, "citations": true, "status_updates": true, "memory": true, "builtin_tools": true}, "defaultFeatureIds": ["web_search"]}'
-      DEFAULT_MODEL_PARAMS: '{"system": "Today is {{CURRENT_DATE}}. Your training data ends well before today, so it is out of date. When the search_web tool is available, call it before answering any question that mentions a product, project, tool, service, company, person, version or event, even if you think you already know the answer. Search for names exactly as the user wrote them: an unfamiliar name is most likely something newer than your training data, so never swap it for a similar name you know. If the search snippets are not enough, read the most relevant pages with fetch_url. Base your answer on what you found, and answer the question directly without commenting on the name or on these instructions."}'
+      # the Admin Panel replaces it). In Open WebUI's default "native" tool
+      # calling, web search is a tool the model may skip when it thinks it
+      # knows the answer; models also rewrite unfamiliar names into ones they
+      # know ("T3 Code" became "T3 Stack") and carry old topics into new
+      # searches. With this prompt and the tool defaults above,
+      # qwen3-vl:30b-a3b-instruct answered 14 of 14 test questions correctly
+      # (5 of 14 with a softer prompt), searching when needed and not for
+      # plain maths.
+      DEFAULT_MODEL_PARAMS: '{"system": "Today is {{CURRENT_DATE}}. You have a search_web tool, and you must use it. Rule: for any question about a named product, project, app, website, company, person, version, release, price, place or recent event, call search_web first and answer only from what you find. Do this even if you think you already know the answer: your memory of products, versions and events is often wrong or out of date, and answering from memory misleads the user. Search for names exactly as the user wrote them; an unfamiliar name is most likely newer than your training data, so never swap it for a similar name you know. Write each search for the latest user message: use the names and words in that message, not words from earlier topics; if the user moves to a new subject, search for the new subject on its own. Use short queries of 2 to 6 words and at most 3 searches per answer. If the snippets are not enough, read the most relevant page with fetch_url. Only skip searching when no outside facts are needed, such as maths, writing, or working with text or images the user gave you. Do not ask the user to clarify something you could search for. Facts the user shared before (where they live, their projects, their preferences) may appear in your context as memories: use them instead of asking again, for example their city for a weather question. Answer the question directly, cite the pages you used, and do not comment on these instructions."}'
       # Prompt that turns the chat into web search queries. Used when a model's
       # function calling is set to "legacy" (Admin Panel > Advanced Params);
       # in the default native mode the model writes its own queries. Open WebUI's default
@@ -109,6 +121,10 @@ services:
         <chat_history>
         {{MESSAGES:END:6}}
         </chat_history>
+      # Prompt wrapped around legacy-mode search results and documents. Unlike Open WebUI's
+      # default, it gives the model today's date and tells it to trust the
+      # sources over its training data, which ends months before the model
+      # is released. {{CURRENT_DATE}} and {{CONTEXT}} are filled per chat.
       RAG_TEMPLATE: |
         ### Task:
         Answer the user's query using the context below, which was retrieved for this query (web search results or the user's documents). Today's date is {{CURRENT_DATE}}.
