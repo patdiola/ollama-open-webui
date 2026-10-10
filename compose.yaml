@@ -46,6 +46,9 @@ services:
       ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
       DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-pending}
       ENABLE_COMMUNITY_SHARING: ${ENABLE_COMMUNITY_SHARING:-false}
+      # API keys (Settings > Account > API Keys) for scripts and tools. Off by
+      # default: a key acts as the account that created it.
+      ENABLE_API_KEYS: ${ENABLE_API_KEYS:-false}
       # Model new chats start with (setup sets the first model you pick).
       DEFAULT_MODELS: ${DEFAULT_MODELS:-}
       # Titles run on the chat model unless TASK_MODEL names another. Tags and

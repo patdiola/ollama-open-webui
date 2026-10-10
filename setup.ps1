@@ -11,6 +11,8 @@
 param([string]$Command = "")
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 may default to TLS 1.0, which current APIs refuse.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 Set-Location -LiteralPath $PSScriptRoot
 
 $EnvFile = Join-Path $PSScriptRoot ".env"
@@ -21,36 +23,220 @@ $script:TsUrl = ""
 
 # ------------------------------------------------------------------ helpers
 
+# Terminal UI. With a console, questions are arrow-key menus, checklists and
+# toggles; with input or output redirected they fall back to plain prompts.
+# Check marks and arrows only in Windows Terminal: the classic console font
+# lacks them.
+$script:Ui = $false
+try { $script:Ui = (-not [Console]::IsInputRedirected) -and (-not [Console]::IsOutputRedirected) } catch { }
+try { if ([Console]::IsOutputRedirected) { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } } catch { }
+if ($env:WT_SESSION) { $script:Check = [string][char]0x2713; $script:Arrow = [string][char]0x276F }
+else { $script:Check = "+"; $script:Arrow = ">" }
+$script:Rule = New-Object String ([char]0x2500), 60
+$script:Dot = [string][char]0x00B7
+$script:KeyInfo = ""
+
 function Say([string]$m)  { Write-Host "  $m" }
-function Ok([string]$m)   { Write-Host "  ok  " -ForegroundColor Green -NoNewline; Write-Host $m }
-function Warn([string]$m) { Write-Host "  !!  " -ForegroundColor Yellow -NoNewline; Write-Host $m }
-function Step([string]$m) { Write-Host ""; Write-Host "== $m" -ForegroundColor Cyan }
-function Fail([string]$m) { Write-Host ""; Write-Host "Error: $m" -ForegroundColor Red; exit 1 }
+function Note([string]$m) { Write-Host "  $m" -ForegroundColor DarkGray }
+function Ok([string]$m)   { Write-Host "  $($script:Check) " -ForegroundColor Green -NoNewline; Write-Host $m }
+function Warn([string]$m) { Write-Host "  ! " -ForegroundColor Yellow -NoNewline; Write-Host $m }
+function Fail([string]$m) { Write-Host ""; Write-Host "  Error: $m" -ForegroundColor Red; exit 1 }
+
+# Section header, with space around it.
+function Step([string]$m) {
+  Write-Host ""; Write-Host ""
+  Write-Host "  $m" -ForegroundColor Cyan
+  Write-Host "  $($script:Rule)" -ForegroundColor DarkGray
+  Write-Host ""
+}
 
 function Ask([string]$q, [string]$def) {
-  $hint = ""
-  if ($def) { $hint = " [$def]" }
-  $r = Read-Host "  $q$hint"
+  Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+  $p = $q
+  if ($def) { $p = "$q ($def)" }
+  $r = Read-Host $p
   if ([string]::IsNullOrWhiteSpace($r)) { return $def }
   return $r.Trim()
 }
 
 function Ask-Secret([string]$q) {
-  $s = Read-Host "  $q" -AsSecureString
+  Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+  $s = Read-Host $q -AsSecureString
   $p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
   try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) }
   finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
 }
 
+function Get-Width {
+  $w = 80
+  try { $w = [Console]::BufferWidth - 1 } catch { }
+  return $w
+}
+
+function Show-Cursor([bool]$on) { try { [Console]::CursorVisible = $on } catch { } }
+
+# One menu row: label, then a grey hint cut to fit the window.
+function Write-MenuRow([bool]$sel, [string]$mark, [string]$label, [string]$hint) {
+  if ($label.Length -gt 34) { $label = $label.Substring(0, 33) + "~" }
+  $lead = "    "
+  if ($sel) { $lead = "  $($script:Arrow) " }
+  $left = $lead + $mark + $label.PadRight(34) + " "
+  $room = (Get-Width) - $left.Length
+  if ($room -lt 0) { $room = 0 }
+  if ($hint.Length -gt $room) { if ($room -gt 3) { $hint = $hint.Substring(0, $room - 3) + "..." } else { $hint = "" } }
+  if ($sel) { Write-Host $left -ForegroundColor Cyan -NoNewline } else { Write-Host $left -NoNewline }
+  Write-Host $hint.PadRight($room) -ForegroundColor DarkGray
+}
+
+# Replaces a finished menu (question line plus $rows rows) with its answer.
+function Close-Menu([string]$q, [string]$answer, [int]$top, [int]$rows) {
+  [Console]::SetCursorPosition(0, $top)
+  for ($i = 0; $i -le $rows; $i++) { Write-Host (" " * (Get-Width)) }
+  [Console]::SetCursorPosition(0, $top)
+  Write-Host "  $($script:Check) " -ForegroundColor Green -NoNewline
+  Write-Host "$q " -NoNewline
+  Write-Host $answer -ForegroundColor White
+  Show-Cursor $true
+}
+
+# YesNo "Question" y|n -> $true/$false. Left/right (or y/n), Enter confirms.
 function YesNo([string]$q, [string]$def) {
-  $hint = "y/N"
-  if ($def -eq "y") { $hint = "Y/n" }
-  while ($true) {
-    $r = Read-Host "  $q [$hint]"
-    if ([string]::IsNullOrWhiteSpace($r)) { $r = $def }
-    if ($r -match "^[Yy]") { return $true }
-    if ($r -match "^[Nn]") { return $false }
+  if (-not $script:Ui) {
+    $hint = "y/N"
+    if ($def -eq "y") { $hint = "Y/n" }
+    while ($true) {
+      $r = Read-Host "  ? $q [$hint]"
+      if ([string]::IsNullOrWhiteSpace($r)) { $r = $def }
+      if ($r -match "^[Yy]") { return $true }
+      if ($r -match "^[Nn]") { return $false }
+    }
   }
+  $sel = ($def -eq "y")
+  Show-Cursor $false
+  $row = [Console]::CursorTop
+  while ($true) {
+    [Console]::SetCursorPosition(0, $row)
+    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+    Write-Host "$q   " -NoNewline
+    if ($sel) {
+      Write-Host "$($script:Arrow) Yes" -ForegroundColor Cyan -NoNewline
+      Write-Host "     No   " -ForegroundColor DarkGray -NoNewline
+    } else {
+      Write-Host "  Yes   " -ForegroundColor DarkGray -NoNewline
+      Write-Host "$($script:Arrow) No   " -ForegroundColor Cyan -NoNewline
+    }
+    $k = [Console]::ReadKey($true)
+    if ($k.Key -eq "Enter") { break }
+    if ("$($k.KeyChar)" -eq "y") { $sel = $true; break }
+    if ("$($k.KeyChar)" -eq "n") { $sel = $false; break }
+    if (@("LeftArrow", "RightArrow", "Tab") -contains "$($k.Key)") { $sel = -not $sel }
+  }
+  $answer = "No"
+  if ($sel) { $answer = "Yes" }
+  [Console]::SetCursorPosition(0, $row)
+  Write-Host (" " * (Get-Width))
+  Close-Menu $q $answer $row 0
+  return $sel
+}
+
+function Split-Items([string[]]$items) {
+  $vals = @(); $labels = @(); $hints = @()
+  foreach ($it in $items) {
+    $p = $it.Split([char]'|', 3)
+    $vals += $p[0]; $labels += $p[1]; $hints += $p[2]
+  }
+  return @(, $vals) + @(, $labels) + @(, $hints)
+}
+
+# Choose "Question" DEFAULT @("value|label|hint", ...) -> the chosen value
+function Choose([string]$q, [string]$def, [string[]]$items) {
+  $parts = Split-Items $items
+  $vals = $parts[0]; $labels = $parts[1]; $hints = $parts[2]
+  $n = $vals.Count
+  $sel = 0
+  for ($i = 0; $i -lt $n; $i++) { if ($vals[$i] -eq $def) { $sel = $i } }
+  if (-not $script:Ui) {
+    Write-Host "  ? $q"
+    for ($i = 0; $i -lt $n; $i++) { Write-Host ("     {0}) {1,-30} {2}" -f ($i + 1), $labels[$i], $hints[$i]) }
+    while ($true) {
+      $r = Read-Host ("     Choice [{0}]" -f ($sel + 1))
+      if ([string]::IsNullOrWhiteSpace($r)) { return $vals[$sel] }
+      if ($r -match '^\d+$' -and [int]$r -ge 1 -and [int]$r -le $n) { return $vals[[int]$r - 1] }
+    }
+  }
+  Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+  Write-Host "$q  " -NoNewline
+  Write-Host "Up/Down to move, Enter to choose" -ForegroundColor DarkGray
+  Show-Cursor $false
+  for ($i = 0; $i -lt $n; $i++) { Write-MenuRow ($i -eq $sel) "" $labels[$i] $hints[$i] }
+  $top = [Console]::CursorTop - $n
+  while ($true) {
+    $k = [Console]::ReadKey($true)
+    $c = "$($k.KeyChar)"
+    if ($k.Key -eq "Enter") { break }
+    if ($k.Key -eq "UpArrow" -or $c -eq "k") { $sel = ($sel + $n - 1) % $n }
+    elseif ($k.Key -eq "DownArrow" -or $k.Key -eq "Tab" -or $c -eq "j") { $sel = ($sel + 1) % $n }
+    elseif ($c -match '^[1-9]$' -and [int]$c -le $n) { $sel = [int]$c - 1 }
+    [Console]::SetCursorPosition(0, $top)
+    for ($i = 0; $i -lt $n; $i++) { Write-MenuRow ($i -eq $sel) "" $labels[$i] $hints[$i] }
+  }
+  Close-Menu $q $labels[$sel] ($top - 1) $n
+  return $vals[$sel]
+}
+
+# Checklist "Question" "preselected values" @("value|label|hint", ...)
+#   -> ticked values, space-separated, in list order
+function Checklist([string]$q, [string]$pre, [string[]]$items) {
+  $parts = Split-Items $items
+  $vals = $parts[0]; $labels = $parts[1]; $hints = $parts[2]
+  $n = $vals.Count
+  $preList = @($pre -split "\s+")
+  $on = @(); foreach ($v in $vals) { $on += ($preList -contains $v) }
+  if (-not $script:Ui) {
+    while ($true) {
+      Write-Host "  ? $q"
+      for ($i = 0; $i -lt $n; $i++) {
+        $x = " "; if ($on[$i]) { $x = "x" }
+        Write-Host ("     {0,2}) [{1}] {2,-28} {3}" -f ($i + 1), $x, $labels[$i], $hints[$i])
+      }
+      $r = Read-Host "     Numbers to tick or untick, Enter when done"
+      if ([string]::IsNullOrWhiteSpace($r)) { break }
+      foreach ($t in ($r -split "\s+")) {
+        if ($t -match '^\d+$' -and [int]$t -ge 1 -and [int]$t -le $n) { $on[[int]$t - 1] = -not $on[[int]$t - 1] }
+      }
+    }
+  } else {
+    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+    Write-Host "$q  " -NoNewline
+    Write-Host "Up/Down to move, Space to tick, Enter when done" -ForegroundColor DarkGray
+    Show-Cursor $false
+    $sel = 0
+    for ($i = 0; $i -lt $n; $i++) {
+      $mark = "[ ] "; if ($on[$i]) { $mark = "[x] " }
+      Write-MenuRow ($i -eq $sel) $mark $labels[$i] $hints[$i]
+    }
+    $top = [Console]::CursorTop - $n
+    while ($true) {
+      $k = [Console]::ReadKey($true)
+      $c = "$($k.KeyChar)"
+      if ($k.Key -eq "Enter") { break }
+      if ($k.Key -eq "UpArrow" -or $c -eq "k") { $sel = ($sel + $n - 1) % $n }
+      elseif ($k.Key -eq "DownArrow" -or $k.Key -eq "Tab" -or $c -eq "j") { $sel = ($sel + 1) % $n }
+      elseif ($k.Key -eq "Spacebar" -or $c -eq "x") { $on[$sel] = -not $on[$sel] }
+      [Console]::SetCursorPosition(0, $top)
+      for ($i = 0; $i -lt $n; $i++) {
+        $mark = "[ ] "; if ($on[$i]) { $mark = "[x] " }
+        Write-MenuRow ($i -eq $sel) $mark $labels[$i] $hints[$i]
+      }
+    }
+  }
+  $out = @(); $names = @()
+  for ($i = 0; $i -lt $n; $i++) { if ($on[$i]) { $out += $vals[$i]; $names += $labels[$i] } }
+  if ($script:Ui) {
+    $shown = "none"; if ($names.Count) { $shown = $names -join ", " }
+    Close-Menu $q $shown ($top - 1) $n
+  }
+  return ($out -join " ")
 }
 
 function Have([string]$name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
@@ -252,7 +438,7 @@ function Pick-ModelFolder([string]$current, [string]$mode) {
   $default = Join-Path $HOME ".ollama\models"
   $inUse = ""
   if ($mode -eq "native") { $inUse = "$(Get-OllamaInUse "OLLAMA_MODELS")".TrimEnd("\") }
-  Say "Searching this PC for models Ollama already downloaded..."
+  Note "Looking for models Ollama already downloaded on this PC..."
   $list = @()
   $candidates = @($current) + @(Find-ModelStores)
   if ($mode -eq "native") { $candidates = @($default, $inUse) + $candidates }
@@ -261,78 +447,88 @@ function Pick-ModelFolder([string]$current, [string]$mode) {
     $d = $d.TrimEnd("\")
     if ($list -notcontains $d) { $list += $d }
   }
-  for ($i = 0; $i -lt $list.Count; $i++) {
-    $d = $list[$i]
-    $note = ""
-    if ($d -eq $default) { $note = "  (Ollama's default)" }
-    if ($d -eq $inUse) { $note = "  (Ollama uses this now)" }
-    Write-Host ("   {0}) {1}{2}" -f ($i + 1), $d, $note)
+  $items = @()
+  if ($mode -eq "container") { $items += "|Inside Docker|Docker's own storage (default)" }
+  foreach ($d in $list) {
     $names = @(Get-StoreModels $d)
-    if ($names.Count) {
-      $shown = ($names | Select-Object -First 4) -join ", "
-      if ($names.Count -gt 4) { $shown = "$shown, ..." }
-      Say "      $($names.Count) models, $(Get-FolderGb $d) GB: $shown"
-    } else { Say "      no models yet" }
+    $hint = "empty"
+    if ($names.Count) { $hint = "$($names.Count) models, $(Get-FolderGb $d) GB: " + (($names | Select-Object -First 3) -join ", ") }
+    if ($d -eq $inUse) { $hint = "Ollama uses this now $($script:Dot) $hint" }
+    elseif ($d -eq $default) { $hint = "Ollama's default $($script:Dot) $hint" }
+    $items += "$d|$d|$hint"
   }
+  $items += "other|Another folder...|type a path; created if missing"
   $free = @()
   foreach ($drive in [IO.DriveInfo]::GetDrives()) {
     if ($drive.DriveType -eq "Fixed" -and $drive.IsReady) {
       $free += "{0} {1:N0} GB" -f $drive.Name.TrimEnd("\"), ($drive.AvailableFreeSpace / 1GB)
     }
   }
-  Say "Free space: $($free -join ', ')"
-  Say ""
-  Say "Models take 2-65 GB each, so pick a drive with room. Picking a folder"
-  Say "that already has models means those won't be downloaded again."
-  if ($mode -eq "container") {
-    Say "Enter a number or a folder path, or press Enter with nothing to keep"
-    Say "models inside Docker."
-  } else {
-    Say "Enter a number or a folder path (created if missing)."
-  }
+  Say "Models take 2-65 GB each. Pick a drive with room, or a folder that"
+  Say "already holds models so they aren't downloaded again."
+  Note "Free space: $($free -join ', ')"
+  Write-Host ""
   $def = $current
   if (-not $def -and $mode -eq "native") { $def = $inUse }
   if (-not $def -and $mode -eq "native") { $def = $default }
-  while ($true) {
-    $a = (Ask "Model folder" $def).Trim().Trim('"').TrimEnd("\")
-    if ($a -match "^\d+$" -and [int]$a -ge 1 -and [int]$a -le $list.Count) { $a = $list[[int]$a - 1] }
-    if (-not $a -and $mode -eq "container") { return "" }
-    if ($a -match "^[A-Za-z]:\\") { break }
-    Warn "Enter a number from the list or a full path like D:\Ollama Models."
+  $d = Choose "Where should models live?" $def $items
+  if ($d -eq "other") {
+    while ($true) {
+      $d = Ask "Folder path" ""
+      $d = "$d".Trim().Trim('"').TrimEnd("\")
+      if ($d -match '^[A-Za-z]:\\') { break }
+      Warn "Enter a full path, like D:\Ollama Models."
+    }
   }
-  if ($a -eq $default) { return "" }
-  return $a
+  if ($d -eq $default) { return "" }
+  return $d
 }
 
+# Asks which models to download. Returns them space-separated, default chat
+# model first.
 function Pick-Models([string]$current) {
   $budget = Get-MemoryBudget
-  Say "Detected: $($budget[1])"
-  Say ""
+  Say "Detected: $($budget[1])."
+  Say "Models marked 'fits' run fully on this PC's GPU and are fast; bigger"
+  Say "ones still work, just slowly. Each takes its size in disk space."
+  Write-Host ""
+  $cur = @($current -split "\s+" | Where-Object { $_ })
   $catalog = Get-Catalog
-  for ($i = 0; $i -lt $catalog.Count; $i++) {
-    $m = $catalog[$i]
-    $fit = "big  "
-    if ($m[1] * 1.2 -le $budget[0]) { $fit = "fits " }
-    Write-Host ("   {0,2}) {1,-18} {2,5} GB  {3}{4}" -f ($i + 1), $m[0], $m[1], $fit, $m[2])
+  $items = @(); $pre = @(); $best = ""; $bestSize = 0
+  foreach ($m in $catalog) {
+    $fit = "too big"
+    if ($m[1] * 1.2 -le $budget[0]) {
+      $fit = "fits"
+      if ($m[1] -gt $bestSize) { $best = $m[0]; $bestSize = $m[1] }
+    }
+    $items += "$($m[0])|$($m[0])|$($m[1]) GB $($script:Dot) $fit $($script:Dot) $($m[2])"
+    if ($cur -contains $m[0]) { $pre += $m[0] }
   }
-  Say ""
-  Say "How to choose: start with one or two models marked 'fits'. Bigger"
-  Say "models are smarter but slower; a model marked 'big' still works, just"
-  Say "slowly. Each one takes its size in disk space. You can add or remove"
-  Say "models later with 'setup.cmd configure'. Browse more at ollama.com/library."
-  Say ""
-  Say "Enter numbers and/or any Ollama tags, separated by spaces (e.g. 2 5)."
-  Say "The first one becomes the default chat model."
-  $answer = Ask "Models to download" $current
-  $out = @()
-  foreach ($c in ($answer -split "\s+" | Where-Object { $_ })) {
-    if ($c -match "^\d+$") {
-      $n = [int]$c
-      if ($n -ge 1 -and $n -le $catalog.Count) { $out += $catalog[$n - 1][0] }
-      else { Warn "No model number $c; skipped." }
-    } else { $out += $c }
+  $known = @($catalog | ForEach-Object { $_[0] })
+  $extra = @($cur | Where-Object { $known -notcontains $_ })
+  if ($pre.Count -eq 0 -and $extra.Count -eq 0 -and $best) { $pre = @($best) }
+  $picked = Checklist "Models to download" ($pre -join " ") $items
+  Write-Host ""
+  Note "Any other model from ollama.com/library? Type its tag (e.g. mistral-small3.2),"
+  Note "space-separated, or press Enter to skip."
+  $more = Ask "Other models" ($extra -join " ")
+  $all = @()
+  foreach ($m in ("$picked $more" -split "\s+")) { if ($m -and $all -notcontains $m) { $all += $m } }
+  if ($all.Count -eq 0) { Warn "No models selected; you can add some later with setup.cmd configure."; return "" }
+  if ($all.Count -gt 1) {
+    $default = EnvGet "DEFAULT_MODELS"
+    if ($all -notcontains $default) { $default = $all[0] }
+    $opts = @()
+    foreach ($m in $all) {
+      $hint = ""
+      foreach ($c in $catalog) { if ($c[0] -eq $m) { $hint = $c[2] } }
+      $opts += "$m|$m|$hint"
+    }
+    Write-Host ""
+    $default = Choose "Which model should new chats start with?" $default $opts
+    $all = @($default) + @($all | Where-Object { $_ -ne $default })
   }
-  return ($out -join " ")
+  return ($all -join " ")
 }
 
 # Largest power-of-two context whose cache fits in $left GB. Calibrated on
@@ -360,39 +556,43 @@ function Configure-Memory([string]$models, [bool]$search) {
     }
   }
   $left = [math]::Round($budget * 0.9 - $largest, 1)
-  Say "Besides the model itself, Ollama needs memory for the conversation it"
-  Say "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
-  Say "part of the model runs on the CPU and replies get much slower."
-  Say "  Memory for models: $budget GB, keeping 10% free for Windows and other apps"
-  if ($largestTag) { Say "  Largest model:     $largestTag, about $largest GB" }
-  Say "  Left for context:  about $left GB"
+  Say "Besides the model, Ollama keeps the conversation (its ""context"") in GPU"
+  Say "memory. If both don't fit, part of the model runs on the CPU and replies"
+  Say "get much slower, so setup leaves headroom."
+  Write-Host ""
+  Note "Memory for models   $budget GB (10% kept free for Windows and other apps)"
+  if ($largestTag) { Note "Largest model       $largestTag, about $largest GB" }
+  Note "Left for context    about $left GB"
   $now = Get-OllamaInUse "OLLAMA_CONTEXT_LENGTH"
-  if ($now) { Say "  Ollama uses now:   $now tokens" }
-  Say ""
-  Say "Flash attention shrinks the context memory and is usually faster. With"
-  Say "it on, the context can be stored at lower precision:"
-  Say "  q8_0  about half the memory, little quality loss"
-  Say "  q4_0  about a quarter; recalls details from long chats a bit less exactly"
-  if ($search) { Say "Recommended with web search: q4_0, so search results get twice the room." }
+  if ($now) { Note "Ollama uses now     $now tokens" }
+  Write-Host ""
   $faDef = "y"
   if ((EnvGet "OLLAMA_FLASH_ATTENTION") -eq "0") { $faDef = "n" }
-  if (YesNo "Use flash attention?" $faDef) {
+  if (YesNo "Use flash attention? (faster, less memory; recommended)" $faDef) {
     $fa = "1"
     $kvDef = EnvGet "OLLAMA_KV_CACHE_TYPE"
     if (-not $kvDef) { if ($search) { $kvDef = "q4_0" } else { $kvDef = "q8_0" } }
-    do { $kv = Ask "Context precision (q8_0 or q4_0)" $kvDef } until (@("q8_0", "q4_0") -contains $kv)
+    $r4 = ""; $r8 = ""
+    if ($search) { $r4 = " (recommended)" } else { $r8 = " (recommended)" }
+    $kv = Choose "Context precision" $kvDef @(
+      "q4_0|4-bit$r4|a quarter of the memory: twice the room for search results",
+      "q8_0|8-bit$r8|half the memory; recalls long chats a bit more exactly")
   } else { $fa = "0"; $kv = "" }
   $suggest = Get-ContextSuggestion $left $kv
-  Say ""
-  Say "About $suggest tokens of context fit in the room left. Lower is safer;"
-  Say "0 leaves it to Ollama. After setup, setup checks that the model fits."
-  if ($search) {
-    Say "Web search needs 16384 or more. With 65536 or more, it sends whole pages"
-    Say "(4 results) instead of excerpts, which gives better answers."
+  $cur = EnvGet "OLLAMA_CONTEXT_LENGTH"
+  $items = @("$suggest|$suggest tokens (recommended)|the most that fits with headroom")
+  foreach ($c in @([int]($suggest / 2), [int]($suggest / 4))) {
+    if ($c -ge 4096) { $items += "$c|$c tokens|safer if other apps use the GPU" }
   }
-  $def = EnvGet "OLLAMA_CONTEXT_LENGTH"
+  if ($cur -and -not ($items | Where-Object { $_.StartsWith("$cur|") })) { $items += "$cur|$cur tokens (current)|your current setting" }
+  $items += "0|Let Ollama decide|its default for this GPU"
+  $items += "other|Another size...|type a number of tokens"
+  Write-Host ""
+  if ($search) { Note "Web search needs 16384 or more; with 65536 or more it reads whole pages." }
+  $def = $cur
   if (-not $def) { $def = "$suggest" }
-  do { $ctx = Ask "Context length in tokens" $def } until ($ctx -match "^\d+$")
+  $ctx = Choose "Context length" $def $items
+  if ($ctx -eq "other") { do { $ctx = Ask "Context length in tokens" "$suggest" } until ($ctx -match '^\d+$') }
   if ($ctx -eq "0") { $ctx = "" }
   return @($ctx, $fa, $kv)
 }
@@ -400,184 +600,268 @@ function Configure-Memory([string]$models, [bool]$search) {
 function Configure-Cloud {
   $urls = EnvGet "OPENAI_API_BASE_URLS"
   $keys = EnvGet "OPENAI_API_KEYS"
+  Say "Cloud models (GPT, Claude, Gemini, ...) are smarter than any model this"
+  Say "PC can run, but chats sent to them leave your machine and cost money per"
+  Say "use. Local models stay private. You can add a cloud model later."
+  Write-Host ""
   if ($urls) {
-    Say "Currently configured: $(@($urls.Split(';')).Count) cloud connection(s)."
-    if (YesNo "Keep them?" "y") { return @($urls, $keys) }
+    if (YesNo "Keep your $(@($urls.Split(';')).Count) cloud connection(s)?" "y") { return @($urls, $keys) }
   }
   $u = @(); $k = @()
-  Say "Cloud models are optional. They're smarter than most local models, but"
-  Say "chats sent to them leave your machine, and the provider bills you per use."
-  Say "Skip this if you want everything private; you can add one later."
-  if (-not (YesNo "Add a cloud model provider (OpenAI, OpenRouter, ...)?" "n")) { return @("", "") }
+  if (-not (YesNo "Add a cloud model provider?" "n")) { return @("", "") }
   while ($true) {
-    Say "  1) OpenAI      GPT models, directly from OpenAI"
-    Say "  2) OpenRouter  one key for many providers (Claude, GPT, Gemini, ...)"
-    Say "  3) Other       any OpenAI-compatible API (Groq, Together, a local server)"
-    $choice = Ask "Provider" "1"
+    Write-Host ""
+    $choice = Choose "Provider" "openrouter" @(
+      "openrouter|OpenRouter|one key for Claude, GPT, Gemini and more",
+      "openai|OpenAI|GPT models, directly from OpenAI",
+      "other|Other|any OpenAI-compatible API (Groq, Together, ...)")
     $url = ""
-    switch ($choice) {
-      "1" {
-        $url = "https://api.openai.com/v1"
-        Say "Get a key: sign in at https://platform.openai.com/api-keys, click"
-        Say "'Create new secret key', and copy it (starts with sk-). API use is"
-        Say "billed separately from ChatGPT; add credit under Settings > Billing."
-      }
-      "2" {
-        $url = "https://openrouter.ai/api/v1"
-        Say "Get a key: sign in at https://openrouter.ai/keys, click 'Create Key',"
-        Say "and copy it (starts with sk-or-). Add credit at openrouter.ai/credits."
-      }
-      "3" {
-        Say "Find the base URL in the provider's API docs (often ends in /v1),"
-        Say "and create a key in their dashboard."
-        $url = Ask "Base URL" ""
-      }
-      default { continue }
+    if ($choice -eq "openai") {
+      $url = "https://api.openai.com/v1"
+      Note "Key: https://platform.openai.com/api-keys > Create new secret key (starts with sk-)."
+      Note "API use is billed separately from ChatGPT; add credit under Settings > Billing."
+    } elseif ($choice -eq "openrouter") {
+      $url = "https://openrouter.ai/api/v1"
+      Note "Key: https://openrouter.ai/keys > Create Key (starts with sk-or-)."
+      Note "Add credit at https://openrouter.ai/credits."
+    } else {
+      Note "Find the base URL in the provider's API docs (often ends in /v1)."
+      $url = Ask "Base URL" ""
     }
     if (-not $url) { continue }
-    $key = Ask-Secret "Paste the API key (hidden; it's saved only in .env)"
+    $key = Ask-Secret "Paste the API key (hidden; saved only in .env)"
     if (-not $key) { Warn "No key entered; skipped."; continue }
     if ($key.Contains(";")) { Warn "Keys can't contain ';'. Skipped."; continue }
     $u += $url; $k += $key
+    Ok "Added $url"
     if (-not (YesNo "Add another provider?" "n")) { break }
   }
   return @(($u -join ";"), ($k -join ";"))
+}
+
+# Checks a search key without using up a search. Returns 0 if it works
+# ($script:KeyInfo says how much is left), 1 if rejected, 2 if unreachable.
+function Check-SearchKey([string]$provider, [string]$key) {
+  if ($key -notmatch '^[A-Za-z0-9_-]+$') { return 1 }
+  try {
+    if ($provider -eq "tavily") {
+      $r = Invoke-RestMethod -Uri "https://api.tavily.com/usage" -Headers @{ Authorization = "Bearer $key" } -TimeoutSec 15
+      $a = $r.account
+      $script:KeyInfo = "$($a.current_plan) plan"
+      if ($a.plan_limit) { $script:KeyInfo += ", $($a.plan_limit - $a.plan_usage) of $($a.plan_limit) searches left this month" }
+    } else {
+      $r = Invoke-RestMethod -Uri "https://serpapi.com/account.json?api_key=$key" -TimeoutSec 15
+      $script:KeyInfo = "$($r.plan_name), $($r.total_searches_left) of $($r.searches_per_month) searches left this month"
+    }
+    return 0
+  } catch {
+    $code = 0
+    try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+    if ($code -eq 401 -or $code -eq 403) { return 1 }
+    return 2
+  }
+}
+
+# Walks through getting a free key. Returns a working key, or "" if skipped.
+function Search-Key([string]$provider, [string]$cur) {
+  if ($provider -eq "tavily") {
+    $name = "Tavily"; $signup = "https://app.tavily.com"; $free = "1,000 searches a month"
+    $how = "Copy the API key from the overview page (starts with tvly-)."
+  } else {
+    $name = "SerpAPI"; $signup = "https://serpapi.com/users/sign_up"; $free = "250 searches a month"
+    $how = "Copy the whole key from https://serpapi.com/manage-api-key."
+  }
+  Write-Host ""
+  Write-Host "  $name  " -NoNewline
+  Write-Host "free plan: $free" -ForegroundColor DarkGray
+  if ($cur) {
+    $rc = Check-SearchKey $provider $cur
+    if ($rc -eq 0) { Ok "Saved key works: $($script:KeyInfo)"; return $cur }
+    if ($rc -eq 2) { Warn "Couldn't reach $name to check the saved key; keeping it."; return $cur }
+    Warn "$name rejects the saved key; let's replace it."
+  }
+  Say "1. Create a free account: $signup"
+  Say "2. $how"
+  $def = "open"
+  while ($true) {
+    $c = Choose "$name key" $def @(
+      "open|Open the sign-up page|in your browser, then paste the key here",
+      "paste|Paste a key|I already have one",
+      "skip|Skip for now|add it later with setup.cmd configure")
+    if ($c -eq "skip") { return "" }
+    if ($c -eq "open") {
+      try { Start-Process $signup; Note "Opened $signup" } catch { Note "Open $signup in your browser." }
+    }
+    $key = Ask-Secret "Paste the $name key (hidden)"
+    $key = "$key" -replace '\s', ''
+    $def = "paste"
+    # Nothing pasted: offer Skip next, so Enter moves on (and unattended runs end).
+    if (-not $key) { $def = "skip"; continue }
+    $rc = Check-SearchKey $provider $key
+    if ($rc -eq 0) { Ok "$name key works: $($script:KeyInfo)"; return $key }
+    if ($rc -eq 2) { Warn "Couldn't reach $name to check the key; saving it anyway."; return $key }
+    Warn "$name rejected that key. Copy the whole key and try again."
+  }
 }
 
 function Configure-Search {
   $cur = EnvGet "WEB_SEARCH_ENGINE"
   if ($cur -eq "external") { $cur = "auto" }
   if ((EnvGet "ENABLE_WEB_SEARCH") -ne "true" -or -not $cur) { $cur = "off" }
-  Say "Web search lets models look things up online; it's on by default. The"
-  Say "search queries, not your whole chat, go to the provider you pick."
-  Say "  off         no web access (most private)"
-  Say "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
-  Say "  brave       needs a Brave Search API key; reliable, independent index"
-  Say "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
-  Say "  serpapi     needs a SerpAPI key; Google results, short snippets"
-  Say "  auto        Tavily, then SerpAPI, then DuckDuckGo, switching automatically"
-  Say "              when one fails or runs out of credits (add the keys you have)"
-  Say "Not sure? Keep duckduckgo; pick off for no web access."
-  do { $engine = Ask "Web search" $cur } until (@("off", "duckduckgo", "brave", "tavily", "serpapi", "auto") -contains $engine)
   $brave = EnvGet "BRAVE_SEARCH_API_KEY"
   $tavily = EnvGet "TAVILY_API_KEY"
   $serpapi = EnvGet "SERPAPI_API_KEY"
-  if ($engine -eq "brave" -and (-not $brave -or -not (YesNo "Keep the saved Brave key?" "y"))) {
-    Say "Get a key: sign up at https://api-dashboard.search.brave.com, choose a"
-    Say "plan (see brave.com/search/api for current pricing), then open"
-    Say "'API Keys' and copy the key."
-    $brave = Ask-Secret "Paste the Brave Search API key (hidden)"
-  }
+  Say "Web search lets the model look things up instead of guessing from"
+  Say "training data that is months or years old. It's what makes answers about"
+  Say "new software, products, prices and news right."
+  Write-Host ""
+  Write-Host "  Recommended: two free accounts, about 5 minutes." -ForegroundColor White
+  Write-Host "    Tavily    " -ForegroundColor White -NoNewline; Write-Host "search built for AI; returns the useful part of each page"
+  Write-Host "    SerpAPI   " -ForegroundColor White -NoNewline; Write-Host "Google results"
+  Say "Auto uses Tavily, switches to SerpAPI if Tavily fails or runs out of"
+  Say "searches, then to DuckDuckGo. DuckDuckGo needs no account but often"
+  Say "returns weak results, and answers suffer for it."
+  Note "Only the search terms the model writes are sent; your chats stay here."
+  Write-Host ""
+  $engine = Choose "Web search" $cur @(
+    "auto|Auto (recommended)|Tavily, then SerpAPI, then DuckDuckGo",
+    "tavily|Tavily only|free account",
+    "serpapi|SerpAPI only|free account; Google results",
+    "brave|Brave Search|needs a Brave Search API key",
+    "duckduckgo|DuckDuckGo only|no account; weaker results",
+    "off|Off|no web access (most private)")
   if ($engine -eq "auto") {
-    Say "Add the keys you have; press Enter to skip one. Without any key, auto"
-    Say "uses DuckDuckGo."
-    if (-not $tavily -or -not (YesNo "Keep the saved Tavily key?" "y")) { $tavily = Ask-Secret "Tavily API key (hidden, Enter to skip)" }
-    if (-not $serpapi -or -not (YesNo "Keep the saved SerpAPI key?" "y")) { $serpapi = Ask-Secret "SerpAPI key (hidden, Enter to skip)" }
-  }
-  if ($engine -eq "tavily" -and (-not $tavily -or -not (YesNo "Keep the saved Tavily key?" "y"))) {
-    Say "Get a key: sign up at https://app.tavily.com; your key (starts with"
-    Say "tvly-) is on the overview page. Check their site for current free limits."
-    $tavily = Ask-Secret "Paste the Tavily API key (hidden)"
-  }
-  if ($engine -eq "serpapi" -and (-not $serpapi -or -not (YesNo "Keep the saved SerpAPI key?" "y"))) {
-    Say "Get a key: sign up at https://serpapi.com, then copy the whole key from"
-    Say "https://serpapi.com/manage-api-key. Check their site for current free limits."
-    $serpapi = Ask-Secret "Paste the SerpAPI key (hidden)"
+    $tavily = Search-Key "tavily" $tavily
+    $serpapi = Search-Key "serpapi" $serpapi
+    if (-not $tavily -and -not $serpapi) { Write-Host ""; Warn "No keys yet, so Auto uses DuckDuckGo. Add keys any time: setup.cmd configure" }
+  } elseif ($engine -eq "tavily") {
+    $tavily = Search-Key "tavily" $tavily
+    if (-not $tavily) { Warn "No Tavily key, so using DuckDuckGo instead."; $engine = "duckduckgo" }
+  } elseif ($engine -eq "serpapi") {
+    $serpapi = Search-Key "serpapi" $serpapi
+    if (-not $serpapi) { Warn "No SerpAPI key, so using DuckDuckGo instead."; $engine = "duckduckgo" }
+  } elseif ($engine -eq "brave") {
+    if (-not $brave -or -not (YesNo "Keep the saved Brave key?" "y")) {
+      Note "Key: https://api-dashboard.search.brave.com > API Keys (see brave.com/search/api for plans)."
+      $brave = Ask-Secret "Paste the Brave Search API key (hidden)"
+    }
   }
   return @($engine, $brave, $tavily, $serpapi)
 }
 
+function Summary-Row([string]$label, [string]$value) {
+  Write-Host ("  {0,-17}" -f $label) -ForegroundColor DarkGray -NoNewline
+  Write-Host $value
+}
+
 function Configure {
   Write-Host ""
-  Write-Host "Open WebUI + Ollama setup (Windows)" -ForegroundColor Cyan
-  Say "Answer each question, or press Enter to keep the value in [brackets]."
-  Say "Nothing is changed until you confirm at the end."
+  Write-Host "  Open WebUI + Ollama setup  " -ForegroundColor Cyan -NoNewline
+  Write-Host "Windows" -ForegroundColor DarkGray
+  Note "A private ChatGPT-style assistant on your own hardware."
+  if ($script:Ui) { Note "Use the arrow keys and Enter to choose, Space to tick boxes. Ctrl+C quits." }
+  Note "Nothing changes until you confirm at the end."
 
-  Step "1/7  Ollama"
-  Say "native:    the Ollama app for Windows. Recommended: simplest, and uses"
-  Say "           NVIDIA and AMD graphics cards automatically."
-  Say "container: Ollama inside Docker. Only if you prefer everything in Docker;"
-  Say "           supports NVIDIA cards or CPU only."
-  Say "Not sure? Press Enter for native."
-  do { $mode = Ask "Ollama mode" (EnvGet "OLLAMA_MODE") } until (@("native", "container") -contains $mode)
+  Step "1 of 7 $($script:Dot) Ollama"
+  $cur = EnvGet "OLLAMA_MODE"
+  $mode = Choose "How should Ollama run?" $cur @(
+    "native|Ollama app for Windows (recommended)|simplest; uses NVIDIA and AMD GPUs automatically",
+    "container|Inside Docker|only if you want everything in Docker; NVIDIA or CPU")
   $hw = ""
   if ($mode -eq "container") {
     $hw = EnvGet "COMPOSE_PROFILES"
-    if (-not $hw) { if ((Get-NvidiaGb) -gt 0) { $hw = "ollama-nvidia" } else { $hw = "ollama-cpu" } }
-    Say "ollama-nvidia  NVIDIA graphics card (Docker Desktop passes it through)"
-    Say "ollama-cpu     no NVIDIA card; works, but slowly"
-    Say "The suggestion below was detected on this machine; press Enter to accept it."
-    do { $hw = Ask "Ollama hardware" $hw } until (@("ollama-cpu", "ollama-nvidia") -contains $hw)
+    $detected = "ollama-cpu"
+    if ((Get-NvidiaGb) -gt 0) { $detected = "ollama-nvidia" }
+    if (-not $hw) { $hw = $detected }
+    $dn = ""; $dc = ""
+    if ($detected -eq "ollama-nvidia") { $dn = " $($script:Dot) detected" } else { $dc = " $($script:Dot) detected" }
+    Write-Host ""
+    $hw = Choose "Hardware" $hw @(
+      "ollama-nvidia|NVIDIA GPU|Docker Desktop passes it through$dn",
+      "ollama-cpu|CPU only|works, but slowly$dc")
   }
 
-  Step "2/7  Models"
+  Step "2 of 7 $($script:Dot) Models"
   $modelsDir = Pick-ModelFolder (EnvGet "OLLAMA_MODELS") $mode
-  Say ""
+  Write-Host ""
   $models = Pick-Models (EnvGet "OLLAMA_PULL_MODELS")
 
-  Step "3/7  Local port"
-  Say "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
-  Say "another app already uses it; then pick any free number like 3001 or 8080."
-  do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
-
-  Step "4/7  Remote access (Tailscale)"
-  Say "Tailscale lets your phone and laptop reach this machine from anywhere at"
-  Say "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
-  Say "Wi-Fi network or the internet. It's free for personal use: create an"
-  Say "account at https://login.tailscale.com/start and install the app on each"
-  Say "device. Say no only if you'll use Open WebUI on this machine alone."
-  $tsDef = "y"
-  if ((EnvGet "TAILSCALE_SERVE") -eq "false") { $tsDef = "n" }
-  $ts = "false"
-  if (YesNo "Set up Tailscale remote access?" $tsDef) { $ts = "true" }
-
-  Step "5/7  Optional extras"
-  $cloud = Configure-Cloud
+  Step "3 of 7 $($script:Dot) Web search"
   $search = Configure-Search
-
-  Step "6/7  GPU memory"
   $searchOn = ($search[0] -ne "off")
+
+  Step "4 of 7 $($script:Dot) GPU memory"
   $memory = Configure-Memory $models $searchOn
   # Whole pages give better answers but need room: 4 pages plus the chat.
   $bypass = "false"; $results = "5"
   if ($searchOn -and $memory[0] -and [int]$memory[0] -ge 65536) { $bypass = "true"; $results = "4" }
 
-  Step "7/7  Where settings live"
-  Say "a) .env (recommended): your answers here, or edits to .env (by hand or by"
-  Say "   an AI coding CLI), are applied on every start. Changes you make to the"
-  Say "   same settings in Open WebUI's Admin Panel reset on restart."
-  Say "b) Admin Panel: .env only sets things up the first time; afterwards you"
-  Say "   manage settings in Open WebUI's web interface."
-  Say "Pick a if you'd rather configure from files or with an AI CLI."
-  $pcDef = "a"
-  if ((EnvGet "ENABLE_PERSISTENT_CONFIG") -eq "true") { $pcDef = "b" }
-  do { $pc = Ask "Choice" $pcDef } until (@("a", "b") -contains $pc)
-  $persist = "false"
-  if ($pc -eq "b") { $persist = "true" }
+  Step "5 of 7 $($script:Dot) Remote access"
+  Say "Tailscale lets your phone and laptop reach this PC from anywhere at"
+  Say "https://<pc-name>.<tailnet>.ts.net, without exposing it to your Wi-Fi"
+  Say "network or the internet. It's free for personal use: create an account at"
+  Say "https://login.tailscale.com/start and install the app on each device."
+  Write-Host ""
+  $tsDef = "y"
+  if ((EnvGet "TAILSCALE_SERVE") -eq "false") { $tsDef = "n" }
+  $ts = "false"
+  if (YesNo "Set up Tailscale remote access?" $tsDef) { $ts = "true" }
 
-  Step "Summary"
+  Step "6 of 7 $($script:Dot) Cloud models (optional)"
+  $cloud = Configure-Cloud
+
+  Step "7 of 7 $($script:Dot) Final details"
+  Say "Open WebUI listens on this PC only (127.0.0.1). Keep 3000 unless another"
+  Say "app uses it."
+  do { $port = Ask "Port" (EnvGet "OPEN_WEBUI_PORT") } until ($port -match "^\d+$")
+  Write-Host ""
+  $pcDef = "false"
+  if ((EnvGet "ENABLE_PERSISTENT_CONFIG") -eq "true") { $pcDef = "true" }
+  $persist = Choose "Where should settings live?" $pcDef @(
+    "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start",
+    "true|Admin Panel|.env only sets things up once; then manage settings in the web UI")
+  Write-Host ""
+  Note "API keys let scripts and tools use Open WebUI as your account."
+  $akDef = "n"
+  if ((EnvGet "ENABLE_API_KEYS") -eq "true") { $akDef = "y" }
+  $apiKeys = "false"
+  if (YesNo "Allow API keys? (only needed for scripts and tools)" $akDef) { $apiKeys = "true" }
+
+  $searchText = $search[0]
+  if ($search[0] -eq "auto") {
+    $chain = @()
+    if ($search[2]) { $chain += "Tavily" }
+    if ($search[3]) { $chain += "SerpAPI" }
+    $chain += "DuckDuckGo"
+    $searchText = "Auto: " + ($chain -join " > ")
+  }
   $modeText = $mode
   if ($hw) { $modeText = "$mode ($hw)" }
-  $settingsFrom = ".env"
-  if ($persist -eq "true") { $settingsFrom = "Admin Panel" }
-  $modelText = $models; if (-not $modelText) { $modelText = "(none)" }
-  $cloudText = $cloud[0]; if (-not $cloudText) { $cloudText = "(none)" }
-  Say "Ollama:        $modeText"
-  Say "Models:        $modelText"
   $dirText = $modelsDir
   if (-not $dirText) { $dirText = "Ollama's default"; if ($mode -eq "container") { $dirText = "inside Docker" } }
-  Say "Model folder:  $dirText"
-  $ctxText = $memory[0]; if (-not $ctxText) { $ctxText = "Ollama default" }
+  $ctxText = $memory[0]
+  if (-not $ctxText) { $ctxText = "Ollama default" }
   if ($memory[1] -eq "1") { $ctxText = "$ctxText tokens, flash attention, $($memory[2]) cache" }
-  Say "Context:       $ctxText"
-  Say "Local URL:     http://localhost:$port"
-  Say "Tailscale:     $ts"
-  Say "Cloud APIs:    $cloudText"
-  $searchText = $search[0]
-  if ($searchOn) { if ($bypass -eq "true") { $searchText = "$searchText, whole pages, $results results" } else { $searchText = "$searchText, excerpts, $results results" } }
-  Say "Web search:    $searchText"
-  Say "Settings from: $settingsFrom"
-  if (-not (YesNo "Save to .env?" "y")) { Fail "Nothing saved." }
+  $first = (($models -split "\s+") | Where-Object { $_ } | Select-Object -First 1)
+  Step "Summary"
+  Summary-Row "Ollama" $modeText
+  $modelText = $models; if (-not $modelText) { $modelText = "(none)" }
+  Summary-Row "Models" $modelText
+  if ($first) { Summary-Row "Chats start with" $first }
+  Summary-Row "Model folder" $dirText
+  Summary-Row "Context" $ctxText
+  Summary-Row "Web search" $searchText
+  $tsText = "this PC only"; if ($ts -eq "true") { $tsText = "Tailscale (tailnet only)" }
+  Summary-Row "Remote access" $tsText
+  $cloudText = $cloud[0]; if (-not $cloudText) { $cloudText = "(none)" }
+  Summary-Row "Cloud models" $cloudText
+  Summary-Row "Local URL" "http://localhost:$port"
+  $settingsFrom = ".env"; if ($persist -eq "true") { $settingsFrom = "Admin Panel" }
+  Summary-Row "Settings from" $settingsFrom
+  $akText = "off"; if ($apiKeys -eq "true") { $akText = "allowed" }
+  Summary-Row "API keys" $akText
+  Write-Host ""
+  if (-not (YesNo "Save these settings and start?" "y")) { Fail "Nothing saved." }
 
   if (-not (Test-Path -LiteralPath $EnvFile)) {
     $text = [IO.File]::ReadAllText($ExampleFile) -replace "`r`n", "`n"
@@ -594,7 +878,7 @@ function Configure {
     EnvSet "OLLAMA_BASE_URL" "http://host.docker.internal:11434"
   }
   EnvSet "OLLAMA_PULL_MODELS" $models
-  EnvSet "DEFAULT_MODELS" (($models -split "\s+") | Where-Object { $_ } | Select-Object -First 1)
+  EnvSet "DEFAULT_MODELS" "$first"
   EnvSet "OLLAMA_MODELS" $modelsDir
   EnvSet "OLLAMA_CONTEXT_LENGTH" $memory[0]
   EnvSet "OLLAMA_FLASH_ATTENTION" $memory[1]
@@ -616,6 +900,7 @@ function Configure {
   EnvSet "BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL" $bypass
   EnvSet "WEB_SEARCH_RESULT_COUNT" $results
   EnvSet "ENABLE_PERSISTENT_CONFIG" $persist
+  EnvSet "ENABLE_API_KEYS" $apiKeys
   Ok "Saved .env"
 }
 

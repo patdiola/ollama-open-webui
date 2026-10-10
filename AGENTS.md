@@ -32,6 +32,7 @@ Every option is documented in [.env.example](.env.example). Common requests:
 
 | Request | `.env` change |
 | --- | --- |
+| API keys | `ENABLE_API_KEYS=true` lets users create keys (Settings → Account) for scripts and tools; default `false`. A key acts as its account |
 | Default chat model | `DEFAULT_MODELS` (setup sets the first of `OLLAMA_PULL_MODELS`). Prefer non-thinking models for chat; thinking models (e.g. `qwen3:30b`) reason at length before every answer |
 | Background tasks | `TASK_MODEL` (empty = chat model), `ENABLE_TAGS_GENERATION` / `ENABLE_FOLLOW_UP_GENERATION` (off: each is another model call on the same GPU) |
 | Add/remove models | `OLLAMA_PULL_MODELS` (space-separated Ollama tags). Removing a tag doesn't delete the model; run `ollama rm <tag>` (native) or `docker exec ollama ollama rm <tag>` (container) |

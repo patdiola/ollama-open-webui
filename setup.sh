@@ -18,40 +18,197 @@ OLLAMA_TUNING="OLLAMA_MODELS OLLAMA_CONTEXT_LENGTH OLLAMA_FLASH_ATTENTION OLLAMA
 
 # ------------------------------------------------------------------ helpers
 
-bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+# Terminal UI. With a terminal attached, questions are arrow-key menus,
+# checklists and toggles; without one (piped input, CI) every question falls
+# back to a plain prompt, so setup still works unattended.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C0=$'\033[0m'; CB=$'\033[1m'; CD=$'\033[2m'; CC=$'\033[36m'; CG=$'\033[32m'; CY=$'\033[33m'; CR=$'\033[31m'
+else
+  C0=""; CB=""; CD=""; CC=""; CG=""; CY=""; CR=""
+fi
+TTY_UI=""
+if [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
+  TTY_UI=1
+  trap 'printf "\033[?25h"' EXIT
+  trap 'printf "\033[?25h\n"; exit 130' INT
+fi
+COLS=$( { [ -n "$TTY_UI" ] && tput cols 2>/dev/null; } || echo 80)
+
+bold() { printf '%s%s%s\n' "$CB" "$*" "$C0"; }
 info() { printf '  %s\n' "$*"; }
-ok()   { printf '  \033[32mok\033[0m  %s\n' "$*"; }
-warn() { printf '  \033[33m!!\033[0m  %s\n' "$*" >&2; }
-die()  { printf '\n\033[31mError:\033[0m %s\n' "$*" >&2; exit 1; }
-step() { printf '\n'; bold "== $*"; }
+note() { printf '  %s%s%s\n' "$CD" "$*" "$C0"; }
+ok()   { printf '  %s✓%s %s\n' "$CG" "$C0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$CY" "$C0" "$*" >&2; }
+die()  { printf '\n  %sError:%s %s\n' "$CR" "$C0" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# step "Title"  -> section header, with space around it
+step() {
+  printf '\n\n  %s%s%s\n  %s────────────────────────────────────────────────────────────%s\n\n' \
+    "$CB$CC" "$*" "$C0" "$CD" "$C0"
+}
 
 # ask "Question" default  -> $REPLY
 ask() {
   local hint=""
-  [ -n "$2" ] && hint=" [$2]"
-  read -r -p "  $1$hint: " REPLY </dev/tty || true
+  [ -n "$2" ] && hint=" $CD($2)$C0"
+  REPLY=""; read -r -p "  $CC?$C0 $1$hint: " REPLY 2>/dev/null </dev/tty || REPLY=""
   [ -z "$REPLY" ] && REPLY="$2"
   return 0
 }
 
 # ask_secret "Question"  -> $REPLY (not echoed)
 ask_secret() {
-  read -r -s -p "  $1: " REPLY </dev/tty || true
+  REPLY=""; read -r -s -p "  $CC?$C0 $1: " REPLY 2>/dev/null </dev/tty || REPLY=""
   printf '\n'
 }
 
-# yesno "Question" y|n  -> exit status
+# read_key  -> $KEY: up, down, left, right, enter, space, tab, or the character
+read_key() {
+  local k rest
+  IFS= read -rsn1 k 2>/dev/null </dev/tty || k=""
+  if [ "$k" = $'\033' ]; then
+    IFS= read -rsn2 rest 2>/dev/null </dev/tty || rest=""
+    case "$rest" in '[A') k=up ;; '[B') k=down ;; '[C') k=right ;; '[D') k=left ;; *) k=esc ;; esac
+  fi
+  case "$k" in '') k=enter ;; ' ') k=space ;; $'\t') k=tab ;; esac
+  KEY=$k
+}
+
+# yesno "Question" y|n  -> exit status. Left/right (or y/n), Enter confirms.
 yesno() {
-  local def="$2" hint="y/N"
-  [ "$def" = y ] && hint="Y/n"
+  local q=$1 sel=$2
+  if [ -z "$TTY_UI" ]; then
+    local hint="y/N"
+    [ "$sel" = y ] && hint="Y/n"
+    while true; do
+      REPLY=""; read -r -p "  ? $q [$hint]: " REPLY 2>/dev/null </dev/tty || REPLY=""
+      case "${REPLY:-$sel}" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; esac
+    done
+  fi
+  printf '\033[?25l'
   while true; do
-    read -r -p "  $1 [$hint]: " REPLY </dev/tty || true
-    case "${REPLY:-$def}" in
-      [Yy]*) return 0 ;;
-      [Nn]*) return 1 ;;
+    if [ "$sel" = y ]; then
+      printf '\r\033[2K  %s?%s %s   %s❯ Yes%s   %sNo%s ' "$CC" "$C0" "$q" "$CB$CC" "$C0" "$CD" "$C0"
+    else
+      printf '\r\033[2K  %s?%s %s   %sYes%s   %s❯ No%s ' "$CC" "$C0" "$q" "$CD" "$C0" "$CB$CC" "$C0"
+    fi
+    read_key
+    case "$KEY" in
+      left|right|tab|h|l) [ "$sel" = y ] && sel=n || sel=y ;;
+      y|Y) sel=y; break ;;
+      n|N) sel=n; break ;;
+      enter) break ;;
     esac
   done
+  printf '\r\033[2K  %s✓%s %s %s%s%s\n\033[?25h' "$CG" "$C0" "$q" "$CB" "$( [ "$sel" = y ] && echo Yes || echo No)" "$C0"
+  [ "$sel" = y ]
+}
+
+# menu_line SELECTED MARK LABEL HINT  (one row of choose/checklist, cut to fit)
+menu_line() {
+  local label=${3:0:34} hint=$4 room=$((COLS - 44))
+  [ "$room" -lt 10 ] && room=10
+  [ "${#hint}" -gt "$room" ] && hint="${hint:0:$((room - 1))}…"
+  if [ "$1" = 1 ]; then
+    printf '\033[2K  %s❯ %s%-34s%s %s%s%s\n' "$CB$CC" "$2" "$label" "$C0" "$CD" "$hint" "$C0"
+  else
+    printf '\033[2K    %s%-34s %s%s%s\n' "$2" "$label" "$CD" "$hint" "$C0"
+  fi
+}
+
+# choose "Question" DEFAULT "value|label|hint" ...  -> $REPLY (the value)
+choose() {
+  local q=$1 def=$2 n=0 sel=0 i it
+  shift 2
+  local vals=() labels=() hints=()
+  for it in "$@"; do
+    vals[n]=${it%%|*}; it=${it#*|}; labels[n]=${it%%|*}; hints[n]=${it#*|}
+    [ "${vals[n]}" = "$def" ] && sel=$n
+    n=$((n + 1))
+  done
+  if [ -z "$TTY_UI" ]; then
+    printf '  ? %s\n' "$q"
+    for ((i = 0; i < n; i++)); do printf '     %d) %-30s %s\n' $((i + 1)) "${labels[i]}" "${hints[i]}"; done
+    while true; do
+      REPLY=""; read -r -p "     Choice [$((sel + 1))]: " REPLY 2>/dev/null </dev/tty || REPLY=""
+      i=${REPLY:-$((sel + 1))}
+      case "$i" in ''|*[!0-9]*) continue ;; esac
+      if [ "$i" -ge 1 ] && [ "$i" -le "$n" ]; then REPLY=${vals[i - 1]}; return 0; fi
+    done
+  fi
+  printf '  %s?%s %s  %s↑/↓ to move, Enter to choose%s\n\033[?25l' "$CC" "$C0" "$q" "$CD" "$C0"
+  while true; do
+    for ((i = 0; i < n; i++)); do menu_line "$( [ "$i" -eq "$sel" ] && echo 1 || echo 0)" "" "${labels[i]}" "${hints[i]}"; done
+    read_key
+    case "$KEY" in
+      up|k) sel=$(( (sel + n - 1) % n )) ;;
+      down|j|tab) sel=$(( (sel + 1) % n )) ;;
+      [1-9]) [ "$KEY" -le "$n" ] && sel=$((KEY - 1)) ;;
+      enter) break ;;
+    esac
+    printf '\033[%dA' "$n"
+  done
+  printf '\033[%dA\033[J  %s✓%s %s %s%s%s\n\033[?25h' $((n + 1)) "$CG" "$C0" "$q" "$CB" "${labels[sel]}" "$C0"
+  REPLY=${vals[sel]}
+}
+
+# checklist "Question" "preselected values" "value|label|hint" ...
+#   -> $REPLY: ticked values, space-separated, in list order
+checklist() {
+  local q=$1 pre=" $2 " n=0 sel=0 i it out="" names=""
+  shift 2
+  local vals=() labels=() hints=() on=()
+  for it in "$@"; do
+    vals[n]=${it%%|*}; it=${it#*|}; labels[n]=${it%%|*}; hints[n]=${it#*|}
+    case "$pre" in *" ${vals[n]} "*) on[n]=1 ;; *) on[n]=0 ;; esac
+    n=$((n + 1))
+  done
+  if [ -z "$TTY_UI" ]; then
+    while true; do
+      printf '  ? %s\n' "$q"
+      for ((i = 0; i < n; i++)); do
+        printf '     %2d) [%s] %-28s %s\n' $((i + 1)) "$( [ "${on[i]}" = 1 ] && echo x || echo ' ')" "${labels[i]}" "${hints[i]}"
+      done
+      REPLY=""; read -r -p "     Numbers to tick or untick, Enter when done: " REPLY 2>/dev/null </dev/tty || REPLY=""
+      [ -n "$REPLY" ] || break
+      for i in $REPLY; do
+        case "$i" in *[!0-9]*) continue ;; esac
+        [ "$i" -ge 1 ] && [ "$i" -le "$n" ] && on[i - 1]=$((1 - on[i - 1]))
+      done
+    done
+  else
+    printf '  %s?%s %s  %s↑/↓ to move, Space to tick, Enter when done%s\n\033[?25l' "$CC" "$C0" "$q" "$CD" "$C0"
+    while true; do
+      for ((i = 0; i < n; i++)); do
+        menu_line "$( [ "$i" -eq "$sel" ] && echo 1 || echo 0)" "$( [ "${on[i]}" = 1 ] && printf '%s[x]%s ' "$CG" "$C0$( [ "$i" -eq "$sel" ] && printf '%s' "$CB$CC")" || echo '[ ] ')" "${labels[i]}" "${hints[i]}"
+      done
+      read_key
+      case "$KEY" in
+        up|k) sel=$(( (sel + n - 1) % n )) ;;
+        down|j|tab) sel=$(( (sel + 1) % n )) ;;
+        space|x) on[sel]=$((1 - on[sel])) ;;
+        enter) break ;;
+      esac
+      printf '\033[%dA' "$n"
+    done
+  fi
+  for ((i = 0; i < n; i++)); do
+    [ "${on[i]}" = 1 ] || continue
+    out="$out ${vals[i]}"; names="$names, ${labels[i]}"
+  done
+  names=${names#, }
+  if [ -n "$TTY_UI" ]; then
+    printf '\033[%dA\033[J  %s✓%s %s %s%s%s\n\033[?25h' $((n + 1)) "$CG" "$C0" "$q" "$CB" "${names:-none}" "$C0"
+  fi
+  REPLY=${out# }
+}
+
+# open_url URL  -> opens it in the browser; fails if there is no desktop
+open_url() {
+  if [ "$OS" = Darwin ]; then open "$1" 2>/dev/null
+  elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have xdg-open; then xdg-open "$1" >/dev/null 2>&1 &
+  else return 1; fi
 }
 
 # env_get KEY  -> value from .env, falling back to .env.example
@@ -272,86 +429,98 @@ store_models() {
 
 # Asks where Ollama keeps models -> $MODELS_DIR ("" for Ollama's default).
 pick_model_folder() {
-  local current="$1" default="" in_use="" list="" d i names count gb
+  local current="$1" default="" in_use="" list="" d names count gb items=() hint def TILDE="~"
   # macOS runs Ollama natively; Linux runs it in Docker.
   if [ "$OS" = Darwin ]; then
     default="$HOME/.ollama/models"
     in_use=$(ollama_in_use OLLAMA_MODELS | sed 's#/*$##') || in_use=""
   fi
-  info "Searching this computer for models Ollama already downloaded..."
+  note "Looking for models Ollama already downloaded on this computer..."
   list=$( { [ -n "$default" ] && echo "$default"; [ -n "$in_use" ] && echo "$in_use"; [ -n "$current" ] && echo "$current"; find_model_stores; } \
     | sed 's#/*$##' | awk 'NF && !seen[$0]++')
-  i=0
+  [ -z "$default" ] && items[${#items[@]}]="|Inside Docker|Docker's own storage (default)"
   while IFS= read -r d; do
     [ -n "$d" ] || continue
-    i=$((i + 1))
-    printf '   %2d) %s%s\n' "$i" "$d" "$( [ "$d" = "$in_use" ] && echo "  (Ollama uses this now)" || { [ "$d" = "$default" ] && echo "  (Ollama's default)"; })"
     names=$(store_models "$d")
     if [ -n "$names" ]; then
       count=$(printf '%s\n' "$names" | wc -l | tr -d ' ')
       gb=$(du -sk "$d/blobs" 2>/dev/null | awk '{ printf "%.0f", $1 / 1048576 }')
-      info "      $count models, ${gb:-0} GB: $(printf '%s\n' "$names" | head -n 4 | paste -sd, - | sed 's/,/, /g')$( [ "$count" -gt 4 ] && echo ", ...")"
+      hint="$count models, ${gb:-0} GB: $(printf '%s\n' "$names" | head -n 3 | paste -sd, - | sed 's/,/, /g')"
     else
-      info "      no models yet"
+      hint="empty"
     fi
+    [ "$d" = "$in_use" ] && hint="Ollama uses this now · $hint"
+    [ "$d" = "$default" ] && [ "$d" != "$in_use" ] && hint="Ollama's default · $hint"
+    items[${#items[@]}]="$d|${d/#$HOME/$TILDE}|$hint"
   done <<EOF
 $list
 EOF
-  info "Free space in your home folder: $(df -Pk "$HOME" | awk 'NR == 2 { printf "%.0f GB", $4 / 1048576 }')"
-  info ""
-  info "Models take 2-65 GB each, so pick a drive with room. Picking a folder"
-  info "that already has models means those won't be downloaded again."
-  if [ -z "$default" ]; then
-    info "Enter a number or a folder path, or press Enter with nothing to keep"
-    info "models inside Docker."
-  else
-    info "Enter a number or a folder path (created if missing)."
+  items[${#items[@]}]="other|Another folder...|type a path; created if missing"
+  info "Models take 2-65 GB each. Pick a drive with room, or a folder that"
+  info "already holds models so they aren't downloaded again."
+  note "Free space in your home folder: $(df -Pk "$HOME" | awk 'NR == 2 { printf "%.0f GB", $4 / 1048576 }')"
+  printf '\n'
+  def=${current:-${in_use:-$default}}
+  choose "Where should models live?" "$def" "${items[@]}"
+  d=$REPLY
+  if [ "$d" = other ]; then
+    while true; do
+      ask "Folder path" ""
+      d=$REPLY
+      case "$d" in "~"/*) d="$HOME/${d#"~"/}" ;; esac
+      d=$(printf '%s' "$d" | sed 's#/*$##')
+      case "$d" in /*) break ;; esac
+      warn "Enter a full path, like /Volumes/Big/ollama."
+    done
   fi
-  while true; do
-    ask "Model folder" "${current:-${in_use:-$default}}"
-    d=$REPLY
-    case "$d" in "~"/*) d="$HOME/${d#"~"/}" ;; esac
-    d=$(printf '%s' "$d" | sed 's#/*$##')
-    case "$d" in
-      *[!0-9]*|'') ;;
-      *) d=$(printf '%s\n' "$list" | sed -n "${d}p") ;;
-    esac
-    if [ -z "$d" ] && [ -z "$default" ]; then MODELS_DIR=""; return 0; fi
-    case "$d" in /*) break ;; esac
-    warn "Enter a number from the list or a full path like /Volumes/Big/ollama."
-  done
   [ "$d" = "$default" ] && d=""
   MODELS_DIR=$d
 }
 
+# in_catalog TAG  -> true if TAG is listed in models.txt
+in_catalog() { awk -F'|' -v t="$1" '$1 == t { f = 1 } END { exit !f }' models.txt; }
+
+# Asks which models to download -> $MODELS (default chat model first)
 pick_models() {
-  local current="$1" mem budget desc i=0 tag size note fit choice out=""
+  local current=" $1 " mem budget desc tag size note fit items=() pre="" extra="" m best="" bestsize=0 default
   mem=$(detect_memory); budget=${mem%%|*}; desc=${mem#*|}
-  info "Detected: $desc"
-  info ""
+  info "Detected: $desc."
+  info "Models marked ${CG}fits${C0} run fully on this machine's GPU and are fast;"
+  info "bigger ones still work, just slowly. Each takes its size in disk space."
+  printf '\n'
   while IFS='|' read -r tag size note; do
     case "$tag" in ''|\#*) continue ;; esac
-    i=$((i + 1))
-    fit=$(awk -v s="$size" -v b="$budget" 'BEGIN { print (s * 1.2 <= b) ? "fits " : "big  " }')
-    printf '   %2d) %-18s %5s GB  %s %s\n' "$i" "$tag" "$size" "$fit" "$note"
+    if awk -v s="$size" -v b="$budget" 'BEGIN { exit !(s * 1.2 <= b) }'; then
+      fit="fits"
+      awk -v s="$size" -v b="$bestsize" 'BEGIN { exit !(s > b) }' && { best=$tag; bestsize=$size; }
+    else
+      fit="too big"
+    fi
+    items[${#items[@]}]="$tag|$tag|$size GB · $fit · $note"
+    case "$current" in *" $tag "*) pre="$pre $tag" ;; esac
   done < models.txt
-  info ""
-  info "How to choose: start with one or two models marked 'fits'. Bigger"
-  info "models are smarter but slower; a model marked 'big' still works, just"
-  info "slowly. Each one takes its size in disk space. You can add or remove"
-  info "models later with './setup.sh configure'. Browse more at ollama.com/library."
-  info ""
-  info "Enter numbers and/or any Ollama tags, separated by spaces (e.g. 2 5)."
-  info "The first one becomes the default chat model."
-  ask "Models to download" "$current"
-  for choice in $REPLY; do
-    case "$choice" in
-      *[!0-9]*) out="$out $choice" ;;
-      *) tag=$(grep -vE '^(#|$)' models.txt | sed -n "${choice}p" | cut -d'|' -f1)
-         [ -n "$tag" ] && out="$out $tag" || warn "No model number $choice; skipped." ;;
-    esac
-  done
-  MODELS=$(echo $out)
+  # Keep tags typed earlier that aren't in the catalog.
+  for m in $current; do in_catalog "$m" || extra="$extra $m"; done
+  [ -n "$pre$extra" ] || pre=$best
+  checklist "Models to download" "$pre" "${items[@]}"
+  MODELS=$REPLY
+  printf '\n'
+  note "Any other model from ollama.com/library? Type its tag (e.g. mistral-small3.2),"
+  note "space-separated, or press Enter to skip."
+  ask "Other models" "$(echo $extra)"
+  MODELS=$(printf '%s\n' $MODELS $REPLY | awk 'NF && !seen[$0]++' | paste -sd' ' -)
+  [ -n "$MODELS" ] || { warn "No models selected; you can add some later with ./setup.sh configure."; return 0; }
+  set -- $MODELS
+  if [ $# -gt 1 ]; then
+    default=$(env_get DEFAULT_MODELS)
+    case " $MODELS " in *" $default "*) ;; *) default=$1 ;; esac
+    items=()
+    for m in $MODELS; do items[${#items[@]}]="$m|$m|$(awk -F'|' -v t="$m" '$1 == t { print $3 }' models.txt)"; done
+    printf '\n'
+    choose "Which model should new chats start with?" "$default" "${items[@]}"
+    MODELS="$REPLY $(printf '%s\n' $MODELS | grep -vxF "$REPLY" | paste -sd' ' -)"
+    MODELS=$(echo $MODELS)
+  fi
 }
 
 # Largest power-of-two context whose cache fits in $1 GB with cache type $2.
@@ -370,7 +539,7 @@ context_suggestion() {
 # With web search on ($1 = true), it favours a 4-bit cache: search results
 # fill the context, so twice the context matters more than exact recall.
 configure_memory() {
-  local search=$1 mem budget m size largest=0 largest_tag="" left suggest def d
+  local search=$1 mem budget m size largest=0 largest_tag="" left suggest def cur items=() c
   mem=$(detect_memory); budget=${mem%%|*}
   for m in $MODELS; do
     size=$(grep -vE '^(#|$)' models.txt | awk -F'|' -v t="$m" '$1 == t { print $2 }')
@@ -378,88 +547,166 @@ configure_memory() {
     if awk -v a="$size" -v b="$largest" 'BEGIN { exit !(a > b) }'; then largest=$size; largest_tag=$m; fi
   done
   left=$(awk -v b="$budget" -v l="$largest" 'BEGIN { printf "%.1f", b * 0.9 - l }')
-  info "Besides the model itself, Ollama needs memory for the conversation it"
-  info "keeps in context. Leave headroom: if it all doesn't fit in GPU memory,"
-  info "part of the model runs on the CPU and replies get much slower."
-  info "  Memory for models: $budget GB, keeping 10% free for the desktop and other apps"
-  [ -n "$largest_tag" ] && info "  Largest model:     $largest_tag, about $largest GB"
-  info "  Left for context:  about $left GB"
-  d=$(ollama_in_use OLLAMA_CONTEXT_LENGTH) && [ -n "$d" ] && info "  Ollama uses now:   $d tokens"
-  info ""
-  info "Flash attention shrinks the context memory and is usually faster. With"
-  info "it on, the context can be stored at lower precision:"
-  info "  q8_0  about half the memory, little quality loss"
-  info "  q4_0  about a quarter; recalls details from long chats a bit less exactly"
-  [ "$search" = true ] && info "Recommended with web search: q4_0, so search results get twice the room."
+  info "Besides the model, Ollama keeps the conversation (its \"context\") in GPU"
+  info "memory. If both don't fit, part of the model runs on the CPU and replies"
+  info "get much slower, so setup leaves headroom."
+  printf '\n'
+  note "Memory for models   $budget GB (10% kept free for the desktop and other apps)"
+  [ -n "$largest_tag" ] && note "Largest model       $largest_tag, about $largest GB"
+  note "Left for context    about $left GB"
+  cur=$(ollama_in_use OLLAMA_CONTEXT_LENGTH) && [ -n "$cur" ] && note "Ollama uses now     $cur tokens"
+  printf '\n'
   def=y; [ "$(env_get OLLAMA_FLASH_ATTENTION)" = 0 ] && def=n
-  if yesno "Use flash attention?" "$def"; then
+  if yesno "Use flash attention? (faster, less memory; recommended)" "$def"; then
     FA=1
     def=$(env_get OLLAMA_KV_CACHE_TYPE)
     [ -n "$def" ] || { [ "$search" = true ] && def=q4_0 || def=q8_0; }
-    while true; do
-      ask "Context precision (q8_0 or q4_0)" "$def"
-      case "$REPLY" in q8_0|q4_0) KV=$REPLY; break ;; esac
-    done
+    choose "Context precision" "$def" \
+      "q4_0|4-bit$( [ "$search" = true ] && echo ' (recommended)')|a quarter of the memory: twice the room for search results" \
+      "q8_0|8-bit$( [ "$search" = true ] || echo ' (recommended)')|half the memory; recalls long chats a bit more exactly"
+    KV=$REPLY
   else
     FA=0; KV=""
   fi
   suggest=$(context_suggestion "$left" "$KV")
-  info ""
-  info "About $suggest tokens of context fit in the room left. Lower is safer;"
-  info "0 leaves it to Ollama. After setup, setup checks that the model fits."
-  if [ "$search" = true ]; then
-    info "Web search needs 16384 or more. With 65536 or more, it sends whole pages"
-    info "(4 results) instead of excerpts, which gives better answers."
-  fi
-  def=$(env_get OLLAMA_CONTEXT_LENGTH); [ -n "$def" ] || def=$suggest
-  while true; do
-    ask "Context length in tokens" "$def"
-    case "$REPLY" in ''|*[!0-9]*) ;; *) CTX=$REPLY; break ;; esac
+  cur=$(env_get OLLAMA_CONTEXT_LENGTH)
+  items=("$suggest|$suggest tokens (recommended)|the most that fits with headroom")
+  for c in $((suggest / 2)) $((suggest / 4)); do
+    [ "$c" -ge 4096 ] && items[${#items[@]}]="$c|$c tokens|safer if other apps use the GPU"
   done
+  if [ -n "$cur" ] && ! printf '%s\n' "${items[@]}" | grep -q "^$cur|"; then
+    items[${#items[@]}]="$cur|$cur tokens (current)|your current setting"
+  fi
+  items[${#items[@]}]="0|Let Ollama decide|its default for this GPU"
+  items[${#items[@]}]="other|Another size...|type a number of tokens"
+  printf '\n'
+  [ "$search" = true ] && note "Web search needs 16384 or more; with 65536 or more it reads whole pages."
+  choose "Context length" "${cur:-$suggest}" "${items[@]}"
+  CTX=$REPLY
+  if [ "$CTX" = other ]; then
+    while true; do
+      ask "Context length in tokens" "$suggest"
+      case "$REPLY" in ''|*[!0-9]*) ;; *) CTX=$REPLY; break ;; esac
+    done
+  fi
   [ "$CTX" = 0 ] && CTX=""
   return 0
 }
 
 configure_cloud() {
-  local urls keys url key n
+  local urls keys n url key
   urls=$(env_get OPENAI_API_BASE_URLS); keys=$(env_get OPENAI_API_KEYS)
+  info "Cloud models (GPT, Claude, Gemini, ...) are smarter than any model this"
+  info "PC can run, but chats sent to them leave your machine and cost money per"
+  info "use. Local models stay private. You can add a cloud model later."
+  printf '\n'
   if [ -n "$urls" ]; then
     n=$(printf '%s' "$urls" | awk -F';' '{ print NF }')
-    info "Currently configured: $n cloud connection(s)."
-    if yesno "Keep them?" y; then
-      CLOUD_URLS=$urls; CLOUD_KEYS=$keys; return
-    fi
+    if yesno "Keep your $n cloud connection(s)?" y; then CLOUD_URLS=$urls; CLOUD_KEYS=$keys; return 0; fi
   fi
   CLOUD_URLS=""; CLOUD_KEYS=""
-  info "Cloud models are optional. They're smarter than most local models, but"
-  info "chats sent to them leave your machine, and the provider bills you per use."
-  info "Skip this if you want everything private; you can add one later."
-  yesno "Add a cloud model provider (OpenAI, OpenRouter, ...)?" n || return 0
+  yesno "Add a cloud model provider?" n || return 0
   while true; do
-    info "  1) OpenAI      GPT models, directly from OpenAI"
-    info "  2) OpenRouter  one key for many providers (Claude, GPT, Gemini, ...)"
-    info "  3) Other       any OpenAI-compatible API (Groq, Together, a local server)"
-    ask "Provider" "1"
+    printf '\n'
+    choose "Provider" openrouter \
+      "openrouter|OpenRouter|one key for Claude, GPT, Gemini and more" \
+      "openai|OpenAI|GPT models, directly from OpenAI" \
+      "other|Other|any OpenAI-compatible API (Groq, Together, ...)"
     case "$REPLY" in
-      1) url=https://api.openai.com/v1
-         info "Get a key: sign in at https://platform.openai.com/api-keys, click"
-         info "'Create new secret key', and copy it (starts with sk-). API use is"
-         info "billed separately from ChatGPT; add credit under Settings > Billing." ;;
-      2) url=https://openrouter.ai/api/v1
-         info "Get a key: sign in at https://openrouter.ai/keys, click 'Create Key',"
-         info "and copy it (starts with sk-or-). Add credit at openrouter.ai/credits." ;;
-      3) info "Find the base URL in the provider's API docs (often ends in /v1),"
-         info "and create a key in their dashboard."
-         ask "Base URL" ""; url=$REPLY ;;
-      *) continue ;;
+      openai) url=https://api.openai.com/v1
+              note "Key: https://platform.openai.com/api-keys > Create new secret key (starts with sk-)."
+              note "API use is billed separately from ChatGPT; add credit under Settings > Billing." ;;
+      openrouter) url=https://openrouter.ai/api/v1
+              note "Key: https://openrouter.ai/keys > Create Key (starts with sk-or-)."
+              note "Add credit at https://openrouter.ai/credits." ;;
+      other)  note "Find the base URL in the provider's API docs (often ends in /v1)."
+              ask "Base URL" ""; url=$REPLY ;;
     esac
     [ -n "$url" ] || continue
-    ask_secret "Paste the API key (hidden; it's saved only in .env)"; key=$REPLY
+    ask_secret "Paste the API key (hidden; saved only in .env)"; key=$REPLY
     [ -n "$key" ] || { warn "No key entered; skipped."; continue; }
     case "$key" in *';'*) warn "Keys can't contain ';'. Skipped."; continue ;; esac
     if [ -z "$CLOUD_URLS" ]; then CLOUD_URLS=$url; CLOUD_KEYS=$key
     else CLOUD_URLS="$CLOUD_URLS;$url"; CLOUD_KEYS="$CLOUD_KEYS;$key"; fi
+    ok "Added $url"
     yesno "Add another provider?" n || break
+  done
+}
+
+# key_ok KEY  -> true if KEY looks like an API key (safe to put in a curl config)
+key_ok() { case "$1" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac; }
+
+# check_tavily KEY / check_serpapi KEY -> 0 works ($KEY_INFO says how much is
+# left), 1 rejected, 2 couldn't check. Neither uses up a search. Keys go to
+# curl on stdin, so they never show in the process list.
+check_tavily() {
+  local out code plan used limit
+  key_ok "$1" || return 1
+  out=$(printf 'header = "Authorization: Bearer %s"\n' "$1" | curl -sS -m 15 -K - -w '\n%{http_code}' https://api.tavily.com/usage 2>/dev/null) || return 2
+  code=${out##*$'\n'}; out=${out%$'\n'*}
+  case "$code" in 200) ;; 401|403) return 1 ;; *) return 2 ;; esac
+  plan=$(printf '%s' "$out" | sed -n 's/.*"current_plan": *"\([^"]*\)".*/\1/p')
+  used=$(printf '%s' "$out" | sed -n 's/.*"plan_usage": *\([0-9]*\).*/\1/p')
+  limit=$(printf '%s' "$out" | sed -n 's/.*"plan_limit": *\([0-9]*\).*/\1/p')
+  KEY_INFO="${plan:-Tavily} plan"
+  [ -n "$limit" ] && KEY_INFO="$KEY_INFO, $((limit - ${used:-0})) of $limit searches left this month"
+  return 0
+}
+check_serpapi() {
+  local out code plan left per
+  key_ok "$1" || return 1
+  out=$(printf 'data-urlencode = "api_key=%s"\n' "$1" | curl -sS -m 15 -G -K - -w '\n%{http_code}' https://serpapi.com/account.json 2>/dev/null) || return 2
+  code=${out##*$'\n'}; out=${out%$'\n'*}
+  case "$code" in 200) ;; 401|403) return 1 ;; *) return 2 ;; esac
+  plan=$(printf '%s' "$out" | sed -n 's/.*"plan_name": *"\([^"]*\)".*/\1/p')
+  left=$(printf '%s' "$out" | sed -n 's/.*"total_searches_left": *\([0-9]*\).*/\1/p')
+  per=$(printf '%s' "$out" | sed -n 's/.*"searches_per_month": *\([0-9]*\).*/\1/p')
+  KEY_INFO="${plan:-SerpAPI}"
+  [ -n "$left" ] && KEY_INFO="$KEY_INFO, $left of ${per:-?} searches left this month"
+  return 0
+}
+
+# search_key tavily|serpapi  -> $REPLY: a working key, or "" if skipped
+search_key() {
+  local p=$1 name cur signup free how key rc def=open
+  case "$p" in
+    tavily)  name=Tavily; cur=$TAVILY_KEY; signup=https://app.tavily.com
+             free="1,000 searches a month"; how="Copy the API key from the overview page (starts with tvly-)." ;;
+    serpapi) name=SerpAPI; cur=$SERPAPI_KEY; signup=https://serpapi.com/users/sign_up
+             free="250 searches a month"; how="Copy the whole key from https://serpapi.com/manage-api-key." ;;
+  esac
+  printf '\n  %s%s%s  %sfree plan: %s%s\n' "$CB" "$name" "$C0" "$CD" "$free" "$C0"
+  if [ -n "$cur" ]; then
+    rc=0; check_$p "$cur" || rc=$?
+    case $rc in
+      0) ok "Saved key works: $KEY_INFO"; REPLY=$cur; return 0 ;;
+      2) warn "Couldn't reach $name to check the saved key; keeping it."; REPLY=$cur; return 0 ;;
+      *) warn "$name rejects the saved key; let's replace it." ;;
+    esac
+  fi
+  info "1. Create a free account: $signup"
+  info "2. $how"
+  [ "$OS" = Darwin ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || def=paste
+  while true; do
+    choose "$name key" "$def" \
+      "open|Open the sign-up page|in your browser, then paste the key here" \
+      "paste|Paste a key|I already have one" \
+      "skip|Skip for now|add it later with ./setup.sh configure"
+    case "$REPLY" in
+      skip) REPLY=""; return 0 ;;
+      open) open_url "$signup" && note "Opened $signup" || note "Open $signup in your browser." ;;
+    esac
+    ask_secret "Paste the $name key (hidden)"
+    key=$(printf '%s' "$REPLY" | tr -d '[:space:]')
+    def=paste
+    # Nothing pasted: offer Skip next, so Enter moves on (and unattended runs end).
+    [ -n "$key" ] || { def=skip; continue; }
+    rc=0; check_$p "$key" || rc=$?
+    case $rc in
+      0) ok "$name key works: $KEY_INFO"; REPLY=$key; return 0 ;;
+      2) warn "Couldn't reach $name to check the key; saving it anyway."; REPLY=$key; return 0 ;;
+      *) warn "$name rejected that key. Copy the whole key and try again." ;;
+    esac
   done
 }
 
@@ -468,131 +715,138 @@ configure_search() {
   cur=$(env_get WEB_SEARCH_ENGINE)
   [ "$cur" = external ] && cur=auto
   [ "$(env_get ENABLE_WEB_SEARCH)" = true ] || cur=off
-  info "Web search lets models look things up online; it's on by default. The"
-  info "search queries, not your whole chat, go to the provider you pick."
-  info "  off         no web access (most private)"
-  info "  duckduckgo  no account or key needed; can be rate-limited if used heavily"
-  info "  brave       needs a Brave Search API key; reliable, independent index"
-  info "  tavily      needs a Tavily API key; built for AI, returns cleaner results"
-  info "  serpapi     needs a SerpAPI key; Google results, short snippets"
-  info "  auto        Tavily, then SerpAPI, then DuckDuckGo, switching automatically"
-  info "              when one fails or runs out of credits (add the keys you have)"
-  info "Not sure? Keep duckduckgo; pick off for no web access."
-  while true; do
-    ask "Web search" "${cur:-off}"
-    case "$REPLY" in off|duckduckgo|brave|tavily|serpapi|auto) SEARCH=$REPLY; break ;; esac
-  done
   BRAVE_KEY=$(env_get BRAVE_SEARCH_API_KEY); TAVILY_KEY=$(env_get TAVILY_API_KEY); SERPAPI_KEY=$(env_get SERPAPI_API_KEY)
-  if [ "$SEARCH" = brave ] && { [ -z "$BRAVE_KEY" ] || ! yesno "Keep the saved Brave key?" y; }; then
-    info "Get a key: sign up at https://api-dashboard.search.brave.com, choose a"
-    info "plan (see brave.com/search/api for current pricing), then open"
-    info "'API Keys' and copy the key."
-    ask_secret "Paste the Brave Search API key (hidden)"; BRAVE_KEY=$REPLY
-  fi
-  if [ "$SEARCH" = auto ]; then
-    info "Add the keys you have; press Enter to skip one. Without any key, auto"
-    info "uses DuckDuckGo."
-    [ -n "$TAVILY_KEY" ] && yesno "Keep the saved Tavily key?" y \
-      || { ask_secret "Tavily API key (hidden, Enter to skip)"; TAVILY_KEY=$REPLY; }
-    [ -n "$SERPAPI_KEY" ] && yesno "Keep the saved SerpAPI key?" y \
-      || { ask_secret "SerpAPI key (hidden, Enter to skip)"; SERPAPI_KEY=$REPLY; }
-  fi
-  if [ "$SEARCH" = tavily ] && { [ -z "$TAVILY_KEY" ] || ! yesno "Keep the saved Tavily key?" y; }; then
-    info "Get a key: sign up at https://app.tavily.com; your key (starts with"
-    info "tvly-) is on the overview page. Check their site for current free limits."
-    ask_secret "Paste the Tavily API key (hidden)"; TAVILY_KEY=$REPLY
-  fi
-  if [ "$SEARCH" = serpapi ] && { [ -z "$SERPAPI_KEY" ] || ! yesno "Keep the saved SerpAPI key?" y; }; then
-    info "Get a key: sign up at https://serpapi.com, then copy the whole key from"
-    info "https://serpapi.com/manage-api-key. Check their site for current free limits."
-    ask_secret "Paste the SerpAPI key (hidden)"; SERPAPI_KEY=$REPLY
-  fi
+  info "Web search lets the model look things up instead of guessing from"
+  info "training data that is months or years old. It's what makes answers about"
+  info "new software, products, prices and news right."
+  printf '\n'
+  info "${CB}Recommended: two free accounts, about 5 minutes.${C0}"
+  info "  ${CB}Tavily${C0}    search built for AI; returns the useful part of each page"
+  info "  ${CB}SerpAPI${C0}   Google results"
+  info "Auto uses Tavily, switches to SerpAPI if Tavily fails or runs out of"
+  info "searches, then to DuckDuckGo. DuckDuckGo needs no account but often"
+  info "returns weak results, and answers suffer for it."
+  note "Only the search terms the model writes are sent; your chats stay here."
+  printf '\n'
+  choose "Web search" "${cur:-auto}" \
+    "auto|Auto (recommended)|Tavily, then SerpAPI, then DuckDuckGo" \
+    "tavily|Tavily only|free account" \
+    "serpapi|SerpAPI only|free account; Google results" \
+    "brave|Brave Search|needs a Brave Search API key" \
+    "duckduckgo|DuckDuckGo only|no account; weaker results" \
+    "off|Off|no web access (most private)"
+  SEARCH=$REPLY
+  case "$SEARCH" in
+    auto)
+      search_key tavily; TAVILY_KEY=$REPLY
+      search_key serpapi; SERPAPI_KEY=$REPLY
+      [ -n "$TAVILY_KEY$SERPAPI_KEY" ] || { printf '\n'; warn "No keys yet, so Auto uses DuckDuckGo. Add keys any time: ./setup.sh configure"; } ;;
+    tavily)
+      search_key tavily; TAVILY_KEY=$REPLY
+      [ -n "$TAVILY_KEY" ] || { warn "No Tavily key, so using DuckDuckGo instead."; SEARCH=duckduckgo; } ;;
+    serpapi)
+      search_key serpapi; SERPAPI_KEY=$REPLY
+      [ -n "$SERPAPI_KEY" ] || { warn "No SerpAPI key, so using DuckDuckGo instead."; SEARCH=duckduckgo; } ;;
+    brave)
+      if [ -z "$BRAVE_KEY" ] || ! yesno "Keep the saved Brave key?" y; then
+        note "Key: https://api-dashboard.search.brave.com > API Keys (see brave.com/search/api for plans)."
+        ask_secret "Paste the Brave Search API key (hidden)"; BRAVE_KEY=$REPLY
+      fi ;;
+  esac
 }
 
-configure() {
-  bold ""
-  bold "Open WebUI + Ollama setup ($OS_NAME)"
-  info "Answer each question, or press Enter to keep the value in [brackets]."
-  info "Nothing is changed until you confirm at the end."
+# summary_row "Label" "value"
+summary_row() { printf '  %s%-16s%s %s\n' "$CD" "$1" "$C0" "$2"; }
 
-  step "1/7  Ollama"
-  local profile=""
+configure() {
+  local profile="" detected port searchtext
+  printf '\n  %sOpen WebUI + Ollama setup%s  %s%s%s\n' "$CB$CC" "$C0" "$CD" "$OS_NAME" "$C0"
+  note "A private ChatGPT-style assistant on your own hardware."
+  [ -n "$TTY_UI" ] && note "Use the arrow keys and Enter to choose, Space to tick boxes. Ctrl+C quits."
+  note "Nothing changes until you confirm at the end."
+
+  step "1 of 7 · Ollama"
   if [ "$OS" = Darwin ]; then
     MODE=native
-    info "macOS: Ollama runs as a native app so it can use the GPU."
+    info "On macOS, Ollama runs as a native app so it can use the GPU."
   else
     MODE=container
-    profile=$(env_get COMPOSE_PROFILES)
-    [ -n "$profile" ] || profile=$(detect_profile)
-    info "Linux: Ollama runs in Docker. Pick the hardware it should use:"
-    info "  ollama-nvidia  NVIDIA graphics card (needs nvidia-container-toolkit)"
-    info "  ollama-amd     AMD Radeon card supported by ROCm"
-    info "  ollama-cpu     no supported GPU; works anywhere, but slowly"
-    info "Not sure? 'nvidia-smi' working means NVIDIA. The suggestion below was"
-    info "detected on this machine; press Enter to accept it."
-    while true; do
-      ask "Ollama hardware" "$profile"
-      case "$REPLY" in ollama-cpu|ollama-nvidia|ollama-amd) profile=$REPLY; break ;; esac
-    done
+    detected=$(detect_profile)
+    profile=$(env_get COMPOSE_PROFILES); [ -n "$profile" ] || profile=$detected
+    info "On Linux, Ollama runs in Docker. Which hardware should it use?"
+    printf '\n'
+    choose "Hardware" "$profile" \
+      "ollama-nvidia|NVIDIA GPU|needs nvidia-container-toolkit$( [ "$detected" = ollama-nvidia ] && echo ' · detected')" \
+      "ollama-amd|AMD GPU (ROCm)|Radeon cards supported by ROCm$( [ "$detected" = ollama-amd ] && echo ' · detected')" \
+      "ollama-cpu|CPU only|works anywhere, but slowly$( [ "$detected" = ollama-cpu ] && echo ' · detected')"
+    profile=$REPLY
   fi
 
-  step "2/7  Models"
+  step "2 of 7 · Models"
   pick_model_folder "$(env_get OLLAMA_MODELS)"
-  info ""
+  printf '\n'
   pick_models "$(env_get OLLAMA_PULL_MODELS)"
 
-  step "3/7  Local port"
-  info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
-  info "another app already uses it; then pick any free number like 3001 or 8080."
-  while true; do
-    ask "Port" "$(env_get OPEN_WEBUI_PORT)"
-    case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
-  done
-
-  step "4/7  Remote access (Tailscale)"
-  info "Tailscale lets your phone and laptop reach this machine from anywhere at"
-  info "https://<pc-name>.<tailnet>.ts.net, without exposing anything to your"
-  info "Wi-Fi network or the internet. It's free for personal use: create an"
-  info "account at https://login.tailscale.com/start and install the app on each"
-  info "device. Say no only if you'll use Open WebUI on this machine alone."
-  if yesno "Set up Tailscale remote access?" "$( [ "$(env_get TAILSCALE_SERVE)" = false ] && echo n || echo y)"; then
-    TS=true; else TS=false; fi
-
-  step "5/7  Optional extras"
-  configure_cloud
+  step "3 of 7 · Web search"
   configure_search
 
-  step "6/7  GPU memory"
+  step "4 of 7 · GPU memory"
   configure_memory "$( [ "$SEARCH" = off ] && echo false || echo true)"
   # Whole pages give better answers but need room: 4 pages plus the chat.
   BYPASS=false; RESULTS=5
   if [ "$SEARCH" != off ] && [ "${CTX:-0}" -ge 65536 ]; then BYPASS=true; RESULTS=4; fi
 
-  step "7/7  Where settings live"
-  info "a) .env (recommended): your answers here, or edits to .env (by hand or by"
-  info "   an AI coding CLI), are applied on every start. Changes you make to the"
-  info "   same settings in Open WebUI's Admin Panel reset on restart."
-  info "b) Admin Panel: .env only sets things up the first time; afterwards you"
-  info "   manage settings in Open WebUI's web interface."
-  info "Pick a if you'd rather configure from files or with an AI CLI."
-  local pc=a
-  [ "$(env_get ENABLE_PERSISTENT_CONFIG)" = true ] && pc=b
-  while true; do
-    ask "Choice" "$pc"
-    case "$REPLY" in a) PERSIST=false; break ;; b) PERSIST=true; break ;; esac
-  done
+  step "5 of 7 · Remote access"
+  info "Tailscale lets your phone and laptop reach this machine from anywhere at"
+  info "https://<pc-name>.<tailnet>.ts.net, without exposing it to your Wi-Fi"
+  info "network or the internet. It's free for personal use: create an account at"
+  info "https://login.tailscale.com/start and install the app on each device."
+  printf '\n'
+  if yesno "Set up Tailscale remote access?" "$( [ "$(env_get TAILSCALE_SERVE)" = false ] && echo n || echo y)"; then
+    TS=true; else TS=false; fi
 
+  step "6 of 7 · Cloud models (optional)"
+  configure_cloud
+
+  step "7 of 7 · Final details"
+  info "Open WebUI listens on this machine only (127.0.0.1). Keep 3000 unless"
+  info "another app uses it."
+  while true; do
+    ask "Port" "$(env_get OPEN_WEBUI_PORT)"
+    case "$REPLY" in ''|*[!0-9]*) ;; *) PORT=$REPLY; break ;; esac
+  done
+  printf '\n'
+  choose "Where should settings live?" "$( [ "$(env_get ENABLE_PERSISTENT_CONFIG)" = true ] && echo true || echo false)" \
+    "false|.env file (recommended)|edit .env or ask an AI CLI; re-applied on every start" \
+    "true|Admin Panel|.env only sets things up once; then manage settings in the web UI"
+  PERSIST=$REPLY
+  printf '\n'
+  note "API keys let scripts and tools use Open WebUI as your account."
+  if yesno "Allow API keys? (only needed for scripts and tools)" "$( [ "$(env_get ENABLE_API_KEYS)" = true ] && echo y || echo n)"; then
+    API_KEYS=true; else API_KEYS=false; fi
+
+  case "$SEARCH" in
+    auto) searchtext="Auto: "
+          [ -z "$TAVILY_KEY" ] || searchtext="${searchtext}Tavily → "
+          [ -z "$SERPAPI_KEY" ] || searchtext="${searchtext}SerpAPI → "
+          searchtext="${searchtext}DuckDuckGo" ;;
+    off)  searchtext="off" ;;
+    *)    searchtext=$SEARCH ;;
+  esac
   step "Summary"
-  info "Ollama:        $MODE${profile:+ ($profile)}"
-  info "Models:        ${MODELS:-(none)}"
-  info "Model folder:  ${MODELS_DIR:-$( [ "$MODE" = native ] && echo "Ollama's default" || echo "inside Docker")}"
-  info "Context:       ${CTX:-Ollama default}$( [ "$FA" = 1 ] && echo " tokens, flash attention, $KV cache")"
-  info "Local URL:     http://localhost:$PORT"
-  info "Tailscale:     $TS"
-  info "Cloud APIs:    ${CLOUD_URLS:-(none)}"
-  info "Web search:    $SEARCH$( [ "$SEARCH" = off ] || { [ "$BYPASS" = true ] && echo ", whole pages, $RESULTS results" || echo ", excerpts, $RESULTS results"; })"
-  info "Settings from: $( [ "$PERSIST" = false ] && echo .env || echo 'Admin Panel')"
-  yesno "Save to .env?" y || die "Nothing saved."
+  summary_row "Ollama" "$MODE${profile:+ ($profile)}"
+  summary_row "Models" "${MODELS:-(none)}"
+  [ -n "$MODELS" ] && summary_row "Chats start with" "${MODELS%% *}"
+  summary_row "Model folder" "${MODELS_DIR:-$( [ "$MODE" = native ] && echo "Ollama's default" || echo "inside Docker")}"
+  summary_row "Context" "${CTX:-Ollama default}$( [ "$FA" = 1 ] && echo " tokens, flash attention, $KV cache")"
+  summary_row "Web search" "$searchtext"
+  summary_row "Remote access" "$( [ "$TS" = true ] && echo 'Tailscale (tailnet only)' || echo 'this machine only')"
+  summary_row "Cloud models" "${CLOUD_URLS:-(none)}"
+  summary_row "Local URL" "http://localhost:$PORT"
+  summary_row "Settings from" "$( [ "$PERSIST" = false ] && echo .env || echo 'Admin Panel')"
+  summary_row "API keys" "$( [ "$API_KEYS" = true ] && echo allowed || echo off)"
+  printf '\n'
+  yesno "Save these settings and start?" y || die "Nothing saved."
 
   if [ ! -f "$ENV_FILE" ]; then
     cp .env.example "$ENV_FILE"
@@ -630,6 +884,7 @@ configure() {
   env_set BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL "$BYPASS"
   env_set WEB_SEARCH_RESULT_COUNT "$RESULTS"
   env_set ENABLE_PERSISTENT_CONFIG "$PERSIST"
+  env_set ENABLE_API_KEYS "$API_KEYS"
   ok "Saved .env"
 }
 
