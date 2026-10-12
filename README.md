@@ -1,4 +1,4 @@
-# ollama-open-webui
+# openwebui-stack
 
 Open WebUI boilerplate for Ollama: private, self-hosted AI chat over Tailscale, nothing exposed to the internet, with separate accounts for family.
 
@@ -9,8 +9,8 @@ Runs on **macOS** (e.g. a Mac Studio), **Windows 10/11**, and **Linux** (desktop
 On the machine that will host it:
 
 ```sh
-git clone https://github.com/patdiola/ollama-open-webui.git
-cd ollama-open-webui
+git clone https://github.com/patdiola/openwebui-stack.git
+cd openwebui-stack
 ```
 
 | OS | Run |
