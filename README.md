@@ -2,6 +2,8 @@
 
 Open WebUI boilerplate for Ollama: private, self-hosted AI chat over Tailscale, nothing exposed to the internet, with separate accounts for family.
 
+**Who this is for:** casual AI users who are comfortable on the command line, have a gaming PC with a GPU (or a Mac with plenty of memory), and want to host their own private AI chat app.
+
 Runs on **macOS** (e.g. a Mac Studio), **Windows 10/11**, and **Linux** (desktop or server).
 
 ## Quick start
