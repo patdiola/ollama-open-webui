@@ -9,3 +9,7 @@ desktop.ini
 
 # Editor
 .vscode/
+
+# Python
+__pycache__/
+*.pyc
